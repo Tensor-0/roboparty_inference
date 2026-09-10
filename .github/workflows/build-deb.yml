@@ -9,10 +9,9 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            os: ubuntu-22.04
+            os: ubuntu-24.04
           - arch: arm64
-            # os: ubuntu-22.04-arm
-            os: [self-hosted, rk3588]
+            os: [self-hosted, Linux, ARM64, "24.04"]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
@@ -51,11 +50,11 @@ jobs:
 
           echo "✅ Tag matches changelog: v$TAG_VERSION"
 
-      - name: Setup ROS 2 Humble
+      - name: Setup ROS 2 Jazzy
         if: matrix.arch == 'amd64'
         uses: ros-tooling/setup-ros@v0.7
         with:
-          required-ros-distributions: humble
+          required-ros-distributions: jazzy
 
       - name: Cache APT packages
         uses: actions/cache@v4
@@ -100,7 +99,7 @@ jobs:
       - name: Build deb package
         run: |
           # Source ROS 2 explicitly to be safe
-          . /opt/ros/humble/setup.sh
+          . /opt/ros/jazzy/setup.sh
           dpkg-buildpackage -us -uc -b
           mv ../*.deb .
           VERSION=$(dpkg-parsechangelog -S Version | cut -d'-' -f1 || echo "unknown")

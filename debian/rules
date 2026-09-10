@@ -1,10 +1,10 @@
 #!/usr/bin/make -f
 export DH_VERBOSE = 1
 export DEB_BUILD_MAINT_OPTIONS = optimize=-lto
-export AMENT_PREFIX_PATH=/opt/ros/humble
-export CMAKE_PREFIX_PATH=/opt/roboparty:/opt/ros/humble
-export PYTHONPATH=/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages
-export LD_LIBRARY_PATH := /opt/ros/humble/lib:$(LD_LIBRARY_PATH)
+export AMENT_PREFIX_PATH=/opt/ros/jazzy
+export CMAKE_PREFIX_PATH=/opt/roboparty:/opt/ros/jazzy
+export PYTHONPATH=/opt/ros/jazzy/lib/python3.12/site-packages:/opt/ros/jazzy/local/lib/python3.12/dist-packages
+export LD_LIBRARY_PATH := /opt/ros/jazzy/lib:$(LD_LIBRARY_PATH)
 export CCACHE_DISABLE = 1
 
 PKG_NAME = roboparty-inference
@@ -26,7 +26,7 @@ override_dh_auto_configure:
 	
 	dh_auto_configure -- \
 		-DCMAKE_INSTALL_PREFIX=/opt/roboparty \
-		-DCMAKE_PREFIX_PATH="/opt/roboparty;/opt/ros/humble" \
+		-DCMAKE_PREFIX_PATH="/opt/roboparty;/opt/ros/jazzy" \
 		-DCMAKE_BUILD_TYPE=Release
 
 override_dh_install:
