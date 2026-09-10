@@ -34,7 +34,6 @@ option(YAML_BUILD_SHARED_LIBS "Build shared library" OFF)
 option(YAML_CPP_BUILD_TESTS "Build tests" OFF)
 option(YAML_CPP_BUILD_TOOLS "Build tools" OFF)
 add_subdirectory(thirdparty)
-fix-24.04-thirdparty-build
 if(NOT EXISTS "${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime_cxx_api.h" OR
    NOT EXISTS "${ONNXRUNTIME_LIB_FILE}")
   find_package(onnxruntime CONFIG QUIET)
