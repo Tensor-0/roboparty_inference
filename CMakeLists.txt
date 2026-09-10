@@ -34,6 +34,17 @@ option(YAML_BUILD_SHARED_LIBS "Build shared library" OFF)
 option(YAML_CPP_BUILD_TESTS "Build tests" OFF)
 option(YAML_CPP_BUILD_TOOLS "Build tools" OFF)
 add_subdirectory(thirdparty)
+fix-24.04-thirdparty-build
+if(NOT EXISTS "${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime_cxx_api.h" OR
+   NOT EXISTS "${ONNXRUNTIME_LIB_FILE}")
+  find_package(onnxruntime CONFIG QUIET)
+  if(onnxruntime_FOUND)
+    set(ONNXRUNTIME_INCLUDE_DIR "")
+    set(ONNXRUNTIME_LIB_FILE onnxruntime::onnxruntime)
+  else()
+    message(FATAL_ERROR "ONNX Runtime was not found in thirdparty or the installation prefix")
+  endif()
+endif()
 
 set(PUBLIC_DEPENDENCIES
     ${Boost_LIBRARIES} pthread Eigen3::Eigen fmt::fmt spdlog::spdlog ${ONNXRUNTIME_LIB_FILE} yaml-cpp)
@@ -85,8 +96,10 @@ install(DIRECTORY launch
 install(DIRECTORY robots
   DESTINATION share/${PROJECT_NAME}
 )
-install(FILES ${ONNXRUNTIME_LIB_FILE} ${ONNXRUNTIME_LIB_FILE}.1 ${ONNXRUNTIME_LIB_FILE}.1.21.0
-        DESTINATION lib)
+if(EXISTS "${ONNXRUNTIME_LIB_FILE}")
+  install(FILES ${ONNXRUNTIME_LIB_FILE} ${ONNXRUNTIME_LIB_FILE}.1 ${ONNXRUNTIME_LIB_FILE}.1.21.0
+          DESTINATION lib)
+endif()
 
 set(PYTHON_INSTALL_DIR "lib/python${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}/site-packages")
 
