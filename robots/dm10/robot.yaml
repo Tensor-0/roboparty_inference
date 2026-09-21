@@ -82,7 +82,9 @@ motors:
     motor_interface: ["can0", "can1"]
     motor_num: [5, 5]
     motor_type: ["DM", "DM"]
-    motor_model: [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]   # 2 = DM4340P_24V (SpdMax 6 / TauMax 12)
+    # ⚠️ 2 = DM4340P_24V（DM-J4340-2EC 24V）。限幅（PMAX/VMAX/TMAX）不在这个文件里，
+    #    唯一来源是 motors 驱动的 dm_limit_param[] 表 —— 在这里抄一份只会在改的时候漏掉。
+    motor_model: [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
     master_id_offset: 0
     motor_zero_offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
