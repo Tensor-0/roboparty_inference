@@ -295,7 +295,15 @@ void InferenceNode::apply_action() {
             last_act_[i] = act_alpha_ * act_[i] + (1 - act_alpha_) * last_act_[i];
         }
     }
-    robot_->apply_action(last_act_);
+    // ⭐ 前馈力矩（2026-09-21）：按 q_des 查表插值，连同位置一起下发。
+    //   为什么需要：τ = Kp·(q_des − q) 的关节必须【下垂一点】才有力矩 ⇒ 稳态误差是必然的。
+    //   加了前馈，那部分提前给了，Kp 只需修零头。
+    //   ⚠️ 符号：这里给【关节坐标】的 τ，motor_sign 由 RobotInterface::motors_mit_cmd
+    //      内部乘（和位置同一个规则：τ_m = sign × τ_j）。
+    //   ⚠️ enabled=false 或表为空时 ff_tau_ 全 0 ⇒ 与原行为逐位等价。
+    //   ⚠️ 表的条件（悬挂/落地）必须和当前运行条件一致 —— 见 robot.yaml 那段注释。
+    update_feedforward(last_act_);
+    robot_->apply_action(last_act_, {}, {}, {}, ff_tau_);
 
     // ⭐ 电机离线降级（2026-09-21）
     //   为什么必须切：离线后 motor->get_motor_pos() 返回【上一帧缓存】，

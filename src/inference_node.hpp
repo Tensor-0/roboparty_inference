@@ -21,6 +21,7 @@
 #include <queue>
 #include <sstream>
 #include <thread>
+#include <utility>          // std::pair —— 前馈表用
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
@@ -255,6 +256,12 @@ class InferenceNode : public rclcpp::Node {
     float clip_actions_;
     float action_rescale_ = 1.0f;
     std::vector<double> action_scale_, clip_cmd_, joint_default_angle_, joint_limits_;
+    // ⭐ 前馈力矩表（2026-09-21）：τ_ff(q) 查表插值。
+    //   来源 robot.yaml 的 gravity_feedforward:（那里的注释写了条件与测法）。
+    //   ⚠️ 表的条件（悬挂/落地）必须和当前运行条件一致，否则会【系统性地】喂错力矩。
+    bool ff_enabled_ = false;
+    std::vector<std::vector<std::pair<double, double>>> ff_table_;  // 每关节 [(q, tau)]，按 q 升序
+    std::vector<float> ff_tau_;                                     // 本周期算出的 τ_ff（关节坐标）
     std::vector<long int> usd2urdf_;
     float gravity_z_upper_;
     int last_button0_ = 0, last_button1_ = 0, last_button2_ = 0, last_button3_ = 0, last_button4_ = 0, last_button5_ = 0;
@@ -279,6 +286,8 @@ class InferenceNode : public rclcpp::Node {
     PolicyRuntime& active_policy();
 
     void load_config();
+    void load_feedforward_table();
+    void update_feedforward(const std::vector<float>& q_des);
     void setup_model(std::unique_ptr<ModelContext>& ctx, std::string model_path, int input_size);
 
     // Policy/model runtime helpers.

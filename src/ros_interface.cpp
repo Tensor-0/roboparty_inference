@@ -3,6 +3,7 @@
 
 #include "inference_node.hpp"
 
+#include <algorithm>   // std::sort —— 前馈表按 q 排序
 #include <limits>
 
 void InferenceNode::load_config() {
@@ -307,6 +308,81 @@ void InferenceNode::load_config() {
                 start_mode_policy_ ? "policy" : "pd_stand");
     RCLCPP_INFO(this->get_logger(), "act_mode (initial): %s",
                 act_mode() == ActMode::POLICY ? "POLICY" : "PD_STAND");
+    load_feedforward_table();
+}
+
+// ⭐ 前馈力矩表（2026-09-21）
+//   从 robot.yaml 的 robot.gravity_feedforward 读。
+//   ⚠️ 用 yaml-cpp 直接读文件，不走 ROS2 参数 —— ROS2 参数不支持嵌套 map
+//      （YAML 的嵌套会变扁平名，列表套列表更没法表达）。
+//   表是【这台机器的物理属性】（和零点、motor_sign 同类），所以放 robot.yaml 是对的。
+void InferenceNode::load_feedforward_table() {
+    ff_enabled_ = false;
+    ff_table_.assign(static_cast<std::size_t>(joint_num_), {});
+    ff_tau_.assign(static_cast<std::size_t>(joint_num_), 0.0f);
+
+    YAML::Node cfg;
+    try {
+        cfg = YAML::LoadFile(robot_config_path_);
+    } catch (const std::exception& e) {
+        RCLCPP_WARN(this->get_logger(), "gravity_feedforward: 读不到 %s (%s) —— 前馈关闭",
+                    robot_config_path_.c_str(), e.what());
+        return;
+    }
+    if (!cfg["robot"] || !cfg["robot"]["gravity_feedforward"]) {
+        RCLCPP_INFO(this->get_logger(),
+                    "gravity_feedforward: robot.yaml 里没有这一段 —— 前馈关闭");
+        return;
+    }
+    const YAML::Node gf = cfg["robot"]["gravity_feedforward"];
+    ff_enabled_ = gf["enabled"] ? gf["enabled"].as<bool>() : false;
+    if (const YAML::Node tbl = gf["table"]) {
+        for (std::size_t i = 0; i < tbl.size() && i < ff_table_.size(); ++i) {
+            for (const auto& pt : tbl[i]) {
+                if (pt.size() != 2) continue;
+                ff_table_[i].emplace_back(pt[0].as<double>(), pt[1].as<double>());
+            }
+            std::sort(ff_table_[i].begin(), ff_table_[i].end(),
+                      [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
+                          return a.first < b.first;
+                      });
+        }
+    }
+    std::size_t covered = 0, npts = 0;
+    for (const auto& t : ff_table_) {
+        if (!t.empty()) { ++covered; npts += t.size(); }
+    }
+    if (ff_enabled_) {
+        RCLCPP_WARN(this->get_logger(),
+                    "\u2b50 前馈力矩【已启用】：%zu/%d 关节有表，共 %zu 点。"
+                    "\u26a0\ufe0f 确认表的条件（悬挂/落地）与当前运行条件一致",
+                    covered, joint_num_, npts);
+    } else {
+        RCLCPP_INFO(this->get_logger(),
+                    "gravity_feedforward: 表已加载但 enabled=false（%zu/%d 关节，%zu 点）",
+                    covered, joint_num_, npts);
+    }
+}
+
+// 按 q_des 查表插值出 τ_ff。250 Hz 调用，10 关节 × ~9 点 —— 开销可忽略。
+void InferenceNode::update_feedforward(const std::vector<float>& q_des) {
+    if (!ff_enabled_) return;
+    for (std::size_t j = 0; j < ff_tau_.size(); ++j) {
+        ff_tau_[j] = 0.0f;
+        if (j >= q_des.size()) continue;
+        const auto& t = ff_table_[j];
+        if (t.empty()) continue;
+        const double q = static_cast<double>(q_des[j]);
+        if (q <= t.front().first) { ff_tau_[j] = static_cast<float>(t.front().second); continue; }
+        if (q >= t.back().first) { ff_tau_[j] = static_cast<float>(t.back().second); continue; }
+        for (std::size_t i = 1; i < t.size(); ++i) {
+            if (q <= t[i].first) {
+                const double w = (q - t[i - 1].first) / (t[i].first - t[i - 1].first);
+                ff_tau_[j] = static_cast<float>(t[i - 1].second * (1.0 - w) + t[i].second * w);
+                break;
+            }
+        }
+    }
 }
 
 void InferenceNode::subs_joy_callback(const std::shared_ptr<sensor_msgs::msg::Joy> msg) {
