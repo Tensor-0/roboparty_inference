@@ -331,7 +331,9 @@ void InferenceNode::control() {
     while(rclcpp::ok()){
         next_release += period;
         try {
-            // ⭐ PD 站立保底（2026-09-17）：在【控制线程】(400Hz, 2.5ms) 做最快的跌倒检查。
+            // ⭐ PD 站立保底（2026-09-17）：在【控制线程】做最快的跌倒检查。
+            //    周期由 dt 决定：robots/dm10/configs/default.yaml 是 dt=0.004 ⇒ 250Hz / 4ms。
+            //    （原文写"400Hz, 2.5ms"，与配置对不上，2026-09-21 核实后改正。）
             //    为什么不放在 inference 线程（50Hz, 20ms）：跌倒时推理可能已发散，
             //    而且观测计算本身慢一拍。这里直接读 IMU，不经推理。
             if (act_mode_.load() == ActMode::POLICY) {
