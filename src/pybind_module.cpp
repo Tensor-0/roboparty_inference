@@ -21,7 +21,9 @@ PYBIND11_MODULE(robot_py, m) {
         .def("reset_joints", &RobotInterface::reset_joints, py::arg("joint_default_angle"))
         .def("set_zeros", &RobotInterface::set_zeros)
         .def("clear_errors", &RobotInterface::clear_errors)
-        .def("read_joints", &RobotInterface::read_joints)
+        // ⚠️ strict 必须在这里显式给默认值 —— C++ 的默认参数不进 pybind11 的签名，
+        //    不给的话 Python 侧 `read_joints()` 会直接 TypeError。
+        .def("read_joints", &RobotInterface::read_joints, py::arg("strict") = true)
         .def("read_imu", &RobotInterface::read_imu)
         .def("refresh_joints", &RobotInterface::refresh_joints)
         .def("get_joint_q", &RobotInterface::get_joint_q)

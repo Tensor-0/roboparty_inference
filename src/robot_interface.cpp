@@ -30,6 +30,17 @@ RobotInterface::RobotInterface(const std::string& config_file) {
         if (motors_node["motor_id"]) motors_cfg_->motor_id_ = motors_node["motor_id"].as<std::vector<long int>>();
         if (motors_node["motor_model"]) motors_cfg_->motor_model_ = motors_node["motor_model"].as<std::vector<long int>>();
         if (motors_node["motor_num"]) motors_cfg_->motor_num_ = motors_node["motor_num"].as<std::vector<long int>>();
+        // ⭐ 电机离线降级（2026-09-21）：阈值可配，默认 25（≈100ms @ dt=4ms）。
+        //   ⚠️ 台架测试时设成 1 就能触发降级路径，不用真去拔 CAN 线
+        //      （带电拔线会触发 gs_usb TX 假死，见 memory gs-usb-tx-wedge）。
+        //   ⚠️ 别设 0 —— 那表示"只要有一次发送还没等到回复就算离线"，
+        //      正常电机偶发一次回复晚到就会误触发。1 表示容忍 1 次。
+        if (motors_node["offline_threshold"]) {
+            offline_threshold_ = motors_node["offline_threshold"].as<int>();
+            if (offline_threshold_ < 0) {
+                offline_threshold_ = 0;
+            }
+        }
         setup_motors();
     } else {
         throw std::runtime_error("Motors configuration not found in " + config_file);
@@ -127,8 +138,15 @@ void RobotInterface::forward_close_chain() {
     }
 }
 
-void RobotInterface::read_joints() {
+void RobotInterface::read_joints(bool strict) {
+    // ⭐ 电机离线降级（2026-09-21）：strict=false 时整条路都不抛。
+    //   is_init_ 这里也要拦 —— 它是个 TOCTOU 竞态：按 X 失能的瞬间，
+    //   apply_action 顶部的 is_init_ 检查可能已经通过，走到这里才翻。
+    //   原来会抛 ⇒ control() 的外层 catch ⇒ rclcpp::shutdown() ⇒ 整个进程被按键干掉。
     if (!is_init_.load()) {
+        if (!strict) {
+            return;
+        }
         throw std::runtime_error("Motors are not initialized");
     }
     std::unique_lock<std::mutex> lock(joint_mutex_);
@@ -137,7 +155,12 @@ void RobotInterface::read_joints() {
         joint_vel_[motor2urdf_[idx]] = motor->get_motor_spd() * robot_cfg_->motor_sign_[idx];
         joint_tau_[motor2urdf_[idx]] = motor->get_motor_current() * robot_cfg_->motor_sign_[idx];
     });
-    throw_if_motors_offline();
+    // ⚠️ 注意：离线时上面读到的是【上一帧缓存】的 joint_q_/joint_vel_（motor->get_motor_pos()
+    //    返回的是缓存值，不发起新请求）⇒ 观测会【冻住】。这正是必须切 PD 的理由，
+    //    不只是"电机坏了"——策略吃到不变的关节角会给出无意义的动作。
+    if (strict) {
+        throw_if_motors_offline();
+    }
 
     if (!close_chain_joint_idx_.empty() && ankle_decouple_) {
         forward_close_chain();
@@ -180,7 +203,12 @@ void RobotInterface::apply_action(const std::vector<float>& p,
     const bool use_close_chain_tau = !close_chain_joint_idx_.empty() && ankle_decouple_;
     std::array<float, 4> ankle_motor_tau{};
 
-    read_joints();
+    // ⭐ 电机离线降级（2026-09-21）：strict=false。
+    //   ⚠️ 这一行是本改动的核心 —— 少了它，read_joints 走默认 true 照旧抛异常，
+    //      control() 的外层 catch 会 rclcpp::shutdown()，机器人瘫倒。
+    //      台架实测抓到的就是这个：签名加了、声明加了、唯独这里没改（2026-09-21 17:53）。
+    //   离线判定改由调用方 InferenceNode::apply_action() 用 motors_offline() 做。
+    read_joints(false);
 
     {
         std::unique_lock<std::mutex> lock(joint_mutex_);
@@ -396,7 +424,20 @@ void RobotInterface::motors_mit_cmd() {
     });
 }
 
-void RobotInterface::throw_if_motors_offline() const {
+// ⭐ 电机离线降级（2026-09-21）：拆成"查询"和"抛"两件事。
+//   motors_offline()   —— 热路径用（control 线程 250Hz），短路返回，不建字符串、不加锁
+//   offline_motor_list() —— 日志用，只在真的要报的时候才建字符串
+//   throw_if_motors_offline() —— 服务/标定路径用，语义与改动前完全一致
+bool RobotInterface::motors_offline() const {
+    for (size_t idx = 0; idx < motors_.size(); ++idx) {
+        if (motors_[idx]->get_response_count() > offline_threshold_) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string RobotInterface::offline_motor_list() const {
     std::string offline_motors;
     for (size_t idx = 0; idx < motors_.size(); ++idx) {
         const int response_count = motors_[idx]->get_response_count();
@@ -410,6 +451,11 @@ void RobotInterface::throw_if_motors_offline() const {
                           std::to_string(motors_cfg_->motor_id_[idx]) +
                           "(count=" + std::to_string(response_count) + ")";
     }
+    return offline_motors;
+}
+
+void RobotInterface::throw_if_motors_offline() const {
+    const std::string offline_motors = offline_motor_list();
     if (!offline_motors.empty()) {
         throw std::runtime_error("Motors offline: " + offline_motors);
     }

@@ -296,6 +296,26 @@ void InferenceNode::apply_action() {
         }
     }
     robot_->apply_action(last_act_);
+
+    // ⭐ 电机离线降级（2026-09-21）
+    //   为什么必须切：离线后 motor->get_motor_pos() 返回【上一帧缓存】，
+    //   观测会冻住 ⇒ 策略吃不变的关节角 ⇒ 给出无意义的动作。不是因为"电机坏了"才切。
+    //
+    //   为什么这里就能救回来：RobotInterface::read_joints 现在收 strict=false，
+    //   离线【不再抛】⇒ 不会再走 control() 的 rclcpp::shutdown() 分支 ⇒
+    //   控制线程活着，活着的电机继续收 PD 帧。
+    //
+    //   ⚠️ 不刷屏：switch_to_pd_stand 只在 act_mode 真的变化时打日志，
+    //      已经在 PD_STAND 时是静默 no-op。字符串也只在真切换那一刻才拼。
+    //   ⚠️ 不自动切回：与跌倒检测一致 —— 反复横跳每次都有动作跳变。
+    if (robot_->is_init_.load() && robot_->motors_offline()) {
+        const bool switching = (act_mode_.load() == ActMode::POLICY);
+        switch_to_pd_stand("motor offline");
+        if (switching) {
+            RCLCPP_WARN(this->get_logger(), "Offline motors: %s",
+                        robot_->offline_motor_list().c_str());
+        }
+    }
 }
 
 void InferenceNode::control() {

@@ -57,7 +57,11 @@ class RobotInterface {
     void reset_joints(std::vector<double> joint_default_angle);
     void set_zeros();
     void clear_errors();
-    void read_joints();
+    // strict=false：电机未使能时【静默返回】、离线时【不抛】—— 给 control 线程用。
+    //   ⚠️ 为什么需要：read_joints() 在 motors_mit_cmd() 【之前】，一抛就本周期一帧都发不出去；
+    //      而 control() 的外层 catch 会 rclcpp::shutdown() ⇒ 之后永远不再发帧 ⇒ 机器人瘫倒。
+    //      true（默认）保持原语义，给 reset_joints / refresh_joints / read_joints 服务用。
+    void read_joints(bool strict = true);
     void read_imu();
     void refresh_joints();
     std::vector<float> get_joint_q() {
@@ -106,6 +110,14 @@ class RobotInterface {
         return lin_acc_buf_;
     }
 
+    // ⭐ 电机离线降级（2026-09-21）
+    //   ⚠️ 这两个【不抛】—— 它们要在 control 线程（250Hz）的热路径上每周期调用。
+    //      抛异常的那条路（throw_if_motors_offline）保留给服务/标定路径。
+    //   ⚠️ 只读 atomic，不拿 joint_mutex_ —— 别在这里加锁。
+    //   语义：某电机【连续】发送未收到回复的次数 > offline_threshold_ ⇒ 判离线
+    //        （response_count_ 每收到一帧就清零，见 dm_motor_driver.cpp:228）
+    bool motors_offline() const;
+    std::string offline_motor_list() const;
 
     std::atomic<bool> is_init_{false};
 
