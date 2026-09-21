@@ -185,6 +185,11 @@ class InferenceNode : public rclcpp::Node {
             "start_inference", std::bind(&InferenceNode::start_inference_srv, this, std::placeholders::_1, std::placeholders::_2));
         stop_inference_service_ = this->create_service<std_srvs::srv::Trigger>(
             "stop_inference", std::bind(&InferenceNode::stop_inference_srv, this, std::placeholders::_1, std::placeholders::_2));
+        // ⭐ PD 站立保底（2026-09-17）
+        switch_to_pd_service_ = this->create_service<std_srvs::srv::Trigger>(
+            "switch_to_pd_stand", std::bind(&InferenceNode::switch_to_pd_srv, this, std::placeholders::_1, std::placeholders::_2));
+        switch_to_policy_service_ = this->create_service<std_srvs::srv::Trigger>(
+            "switch_to_policy", std::bind(&InferenceNode::switch_to_policy_srv, this, std::placeholders::_1, std::placeholders::_2));
     }
     ~InferenceNode() {
         is_running_.store(false);
@@ -204,9 +209,22 @@ class InferenceNode : public rclcpp::Node {
     }
     bool supports_interrupt() const;
     bool has_motion_policy() const;
+
+    // ⭐ PD 站立保底 —— 模式枚举（2026-09-17 新增）
+    //   PD_STAND：不跑网络，act_ 恒 = joint_default_angle_（僵直站立，可手扶）
+    //   POLICY  ：正常跑策略
+    //   ⚠️ 默认 PD_STAND（安全优先）。要跑策略必须显式切（service 或手柄）。
+    //   ⚠️ 跌倒/关节超限【自动切到 PD_STAND，且不自动切回】——
+    //      自动切回会在阈值附近反复横跳，而每次切换都有动作跳变。
+    enum class ActMode { PD_STAND, POLICY };
+    void switch_to_pd_stand(const char* reason);
+    void switch_to_policy();
+    ActMode act_mode() const { return act_mode_.load(); }
    private:
     std::shared_ptr<RobotInterface> robot_;
     std::atomic<bool> is_running_{false}, is_joy_control_{true}, is_interrupt_{false}, is_motion_policy_{false};
+    std::atomic<ActMode> act_mode_{ActMode::PD_STAND};   // ⭐ 默认安全
+    bool start_mode_policy_ = false;                     // 启动参数（yaml start_mode: policy 时为 true）
     std::string robot_config_path_;
     std::string perception_obs_topic_;
     size_t current_motion_policy_idx_ = 0;
@@ -242,7 +260,8 @@ class InferenceNode : public rclcpp::Node {
     int last_button0_ = 0, last_button1_ = 0, last_button2_ = 0, last_button3_ = 0, last_button4_ = 0, last_button5_ = 0;
     std::vector<PolicyRuntime> policies_;
     std::vector<int> motion_policy_indices_;
-    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_joints_service_, set_zeros_service_, clear_errors_service_, refresh_joints_service_, read_joints_service_, read_imu_service_, init_motors_service_, deinit_motors_service_, start_inference_service_, stop_inference_service_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_joints_service_, set_zeros_service_, clear_errors_service_, refresh_joints_service_, read_joints_service_, read_imu_service_, init_motors_service_, deinit_motors_service_, start_inference_service_, stop_inference_service_,\
+        switch_to_pd_service_, switch_to_policy_service_;
 
     std::mutex act_mutex_, perception_mutex_, interrupt_mutex_, cmd_mutex_, mode_mutex_, control_mutex_, lb_switch_mutex_;
     std::vector<float> act_, last_act_, cmd_vel_, interrupt_action_, perception_obs_buffer_;
@@ -320,6 +339,10 @@ class InferenceNode : public rclcpp::Node {
                       std::shared_ptr<std_srvs::srv::Trigger::Response> response);
     void start_inference_srv(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
                              std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+    void switch_to_pd_srv(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+                          std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+    void switch_to_policy_srv(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+                              std::shared_ptr<std_srvs::srv::Trigger::Response> response);
     void stop_inference_srv(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
                             std::shared_ptr<std_srvs::srv::Trigger::Response> response);
     void publish_joint_states();

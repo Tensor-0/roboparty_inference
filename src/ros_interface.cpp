@@ -41,6 +41,10 @@ void InferenceNode::load_config() {
     this->declare_parameter<std::vector<double>>("joint_default_angle", std::vector<double>{});
     this->declare_parameter<std::vector<double>>("joint_limits", std::vector<double>{});
     this->declare_parameter<float>("gravity_z_upper", -0.5);
+    // ⭐ PD 站立保底（2026-09-17）：启动模式。默认 pd_stand（安全优先）。
+    //   "pd_stand" ⇒ 启动即 PD 站立（不跑策略），要跑策略需显式切（service/手柄）
+    //   "policy"   ⇒ 旧行为（启动即跑策略）
+    this->declare_parameter<std::string>("start_mode", "pd_stand");
     this->declare_parameter<double>("gamma", 0.8);
     this->declare_parameter<int>("window_size", 1);
     std::vector<std::string> model_names;
@@ -100,6 +104,13 @@ void InferenceNode::load_config() {
     this->get_parameter("joint_default_angle", joint_default_angle_);
     this->get_parameter("joint_limits", joint_limits_);
     this->get_parameter("gravity_z_upper", gravity_z_upper_);
+    {
+        std::string sm = "pd_stand";
+        this->get_parameter("start_mode", sm);
+        start_mode_policy_ = (sm == "policy");
+        // ⚠️ 默认安全：只有显式写 "policy" 才启动即跑策略
+        act_mode_.store(start_mode_policy_ ? ActMode::POLICY : ActMode::PD_STAND);
+    }
     double latent_gamma = 0.8;
     this->get_parameter("gamma", latent_gamma);
     int latent_window_size = 1;
@@ -292,6 +303,10 @@ void InferenceNode::load_config() {
     print_vector<double>("joint_default_angle", joint_default_angle_);
     print_vector<double>("joint_limits", joint_limits_);
     RCLCPP_INFO(this->get_logger(), "gravity_z_upper: %f", gravity_z_upper_);
+    RCLCPP_INFO(this->get_logger(), "start_mode: %s",
+                start_mode_policy_ ? "policy" : "pd_stand");
+    RCLCPP_INFO(this->get_logger(), "act_mode (initial): %s",
+                act_mode() == ActMode::POLICY ? "POLICY" : "PD_STAND");
 }
 
 void InferenceNode::subs_joy_callback(const std::shared_ptr<sensor_msgs::msg::Joy> msg) {
@@ -619,6 +634,31 @@ void InferenceNode::start_inference_srv(const std::shared_ptr<std_srvs::srv::Tri
     response->message = "Inference started";
 }
 
+// ⭐ PD 站立保底（2026-09-17）：手动切模式（上机四步第②步手扶用）
+void InferenceNode::switch_to_pd_srv(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                                     std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+    if (act_mode() == ActMode::PD_STAND) {
+        response->success = false;
+        response->message = "Already in PD_STAND";
+        return;
+    }
+    switch_to_pd_stand("manual switch");
+    response->success = true;
+    response->message = "Switched to PD_STAND";
+}
+
+void InferenceNode::switch_to_policy_srv(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                                         std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+    if (act_mode() == ActMode::POLICY) {
+        response->success = false;
+        response->message = "Already in POLICY";
+        return;
+    }
+    switch_to_policy();
+    response->success = true;
+    response->message = "Switched to POLICY";
+}
+
 void InferenceNode::stop_inference_srv(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
                                        std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
     if (!is_running_.load()) {
@@ -659,6 +699,7 @@ void InferenceNode::publish_action() {
 void InferenceNode::publish_imu() {
     const auto quat = robot_->get_quat();
     const auto ang_vel = robot_->get_ang_vel();
+    const auto lin_acc = robot_->get_lin_acc();
     auto msg = sensor_msgs::msg::Imu();
     msg.header.stamp = this->now();
     msg.orientation.w = quat[0];
@@ -668,5 +709,10 @@ void InferenceNode::publish_imu() {
     msg.angular_velocity.x = ang_vel[0];
     msg.angular_velocity.y = ang_vel[1];
     msg.angular_velocity.z = ang_vel[2];
+    // Body-frame linear acceleration in m/s^2. The DM-IMU-L1 reports ~+9.8 on z
+    // at rest, matching the sensor_msgs/Imu convention, so gravity is NOT removed.
+    msg.linear_acceleration.x = lin_acc[0];
+    msg.linear_acceleration.y = lin_acc[1];
+    msg.linear_acceleration.z = lin_acc[2];
     imu_publisher_->publish(msg);
 }

@@ -200,10 +200,12 @@ void InferenceNode::get_gravity_b_obs(std::vector<float>& segment) {
     Eigen::Vector3f gravity_w(0.0f, 0.0f, -1.0f);
     Eigen::Quaternionf q_w2b = q_b2w.inverse();
     Eigen::Vector3f gravity_b = q_w2b * gravity_w;
-    if (gravity_b.z() > gravity_z_upper_){
-        RCLCPP_FATAL(this->get_logger(), "Robot fell down! Shutting down...");
-        rclcpp::shutdown();
-        throw std::runtime_error("Robot fell down");
+    // ⭐ PD 站立保底（2026-09-17）：跌倒【不再关机】，改为切 PD 站立。
+    //    ⚠️ 不 throw —— 抛异常会杀掉推理线程，而我们要的是"降级"而非"死亡"。
+    //    （真正的快速检测在 control() 线程里，这里只是二道防线。）
+    if (std::isfinite(gravity_b.z()) && gravity_b.z() > gravity_z_upper_){
+        switch_to_pd_stand("fall detected in obs (gravity_b.z > threshold)");
+        // 继续填 segment（本周期观测仍会算完，虽然 PD 模式下已不喂网络）
     }
     segment[0] = gravity_b.x() * obs_scales_gravity_b_;
     segment[1] = gravity_b.y() * obs_scales_gravity_b_;
@@ -224,9 +226,10 @@ void InferenceNode::get_dof_pos_obs(std::vector<float>& segment) {
     }
     for(size_t i = 0; i < joint_limits_.size() / 2; i++){
         if(joint_pos_buffer_[i] < joint_limits_[i * 2] || joint_pos_buffer_[i] > joint_limits_[i * 2 + 1]){
-            RCLCPP_FATAL(this->get_logger(), "Joint %zu out of limit! Shutting down...", i+1);
-            rclcpp::shutdown();
-            throw std::runtime_error("Joint out of limit");
+            // ⭐ PD 站立保底（2026-09-17）：超限【不再关机】，改为切 PD 站立。
+            //    ⚠️ 不 throw（见上）。切 PD 后不再喂网络，所以 segment 填不填无所谓。
+            switch_to_pd_stand("joint out of limit");
+            break;
         }
     }
 }

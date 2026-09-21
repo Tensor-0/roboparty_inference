@@ -138,6 +138,32 @@ void InferenceNode::setup_model(std::unique_ptr<ModelContext>& ctx, std::string 
         *ctx->memory_info, ctx->output_buffer.data(), ctx->output_buffer.size(), ctx->output_shape.data(), ctx->output_shape.size()));
 }
 
+// ⭐ PD 站立保底（2026-09-17）
+//   switch_to_pd_stand：把 act_ 的目标改成 joint_default_angle_（PD 站立）。
+//     ⚠️ 不直接改 last_act_ —— 让 control 线程里的 act_alpha 平滑把它带过去（防跳变）。
+//   switch_to_policy：切回策略。
+//   ⚠️ 切到 PD 后【不自动切回】（跌倒是"出事"，自动切回会在阈值附近反复横跳）。
+void InferenceNode::switch_to_pd_stand(const char* reason) {
+    ActMode prev = act_mode_.exchange(ActMode::PD_STAND);
+    if (prev != ActMode::PD_STAND) {
+        RCLCPP_WARN(this->get_logger(),
+                    "act_mode: POLICY -> PD_STAND  (%s)", reason ? reason : "");
+    }
+}
+
+void InferenceNode::switch_to_policy() {
+    ActMode prev = act_mode_.exchange(ActMode::POLICY);
+    if (prev != ActMode::POLICY) {
+        RCLCPP_INFO(this->get_logger(), "act_mode: PD_STAND -> POLICY");
+        // 切回策略时让推理从干净状态开始（清 last_act_ 会让它突然弹回，
+        // 所以只重置策略内部状态，动作仍由 act_alpha 平滑过渡）
+        std::unique_lock<std::mutex> lock(act_mutex_);
+        for (auto& policy : policies_) {
+            policy.is_first_frame = true;
+        }
+    }
+}
+
 void InferenceNode::reset_runtime_state() {
     is_running_.store(false);
     std::unique_lock<std::mutex> mode_lock(mode_mutex_);
@@ -251,7 +277,16 @@ void InferenceNode::reset_policy_runtime(PolicyRuntime& policy) {
 
 void InferenceNode::apply_action() {
     std::unique_lock<std::mutex> control_lock(control_mutex_);
-    if(!is_running_.load()){
+    // ⭐ PD 站立保底（2026-09-17）：PD 模式【绕过 is_running_】。
+    //
+    //   为什么：is_running_ 的语义是"策略要不要跑"（操作员按 B 暂停时会置 false）。
+    //   而 PD 站立是【兜底】—— 它不该依赖"策略是否在跑"：
+    //     ① 出事降级时，策略可能已被暂停 ⇒ 若也走 is_running_ 检查，则 PD 也下发不出去 ⇒ 仍然瘫软
+    //     ② 操作员主动按 B 暂停时，他要的是"松掉" ⇒ 不该被 PD 覆盖
+    //   ⇒ 所以把两条路分开：POLICY 模式仍受 is_running_ 管；PD_STAND 模式独立下发。
+    //   ⚠️ 副作用（已知且刻意）：进入 PD 后，按 B 暂停不会让电机松掉。要松掉请按 X 失能。
+    const bool pd_mode = (act_mode_.load() == ActMode::PD_STAND);
+    if (!pd_mode && !is_running_.load()) {
         return;
     }
     {
@@ -276,6 +311,23 @@ void InferenceNode::control() {
     while(rclcpp::ok()){
         next_release += period;
         try {
+            // ⭐ PD 站立保底（2026-09-17）：在【控制线程】(400Hz, 2.5ms) 做最快的跌倒检查。
+            //    为什么不放在 inference 线程（50Hz, 20ms）：跌倒时推理可能已发散，
+            //    而且观测计算本身慢一拍。这里直接读 IMU，不经推理。
+            if (act_mode_.load() == ActMode::POLICY) {
+                try {
+                    auto q = robot_->get_quat();
+                    Eigen::Quaternionf q_b2w(q[0], q[1], q[2], q[3]);
+                    Eigen::Vector3f g_b = q_b2w.inverse() * Eigen::Vector3f(0.0f, 0.0f, -1.0f);
+                    // ⚠️ NaN 检查：IMU 掉线时四元数会全 0 → NaN，而 NaN > 阈值恒 false
+                    //    ⇒ 会静默失去保护（已知限制 #1）。这里显式拦。
+                    if (std::isfinite(g_b.z()) && g_b.z() > gravity_z_upper_) {
+                        switch_to_pd_stand("fall detected (gravity_b.z > threshold)");
+                    }
+                } catch (const std::exception& e) {
+                    switch_to_pd_stand("IMU read failed in safety check");
+                }
+            }
             apply_action();
         } catch (const std::exception& e) {
             RCLCPP_FATAL(this->get_logger(), "Exception in control thread: %s", e.what());
@@ -346,6 +398,30 @@ void InferenceNode::inference() {
                 std::this_thread::sleep_until(next_release);
                 continue;
             }
+            // ⭐ PD 站立保底（2026-09-17）：PD 模式下【不跑网络】，
+            //    act_ 直接置为 joint_default_angle_（PD 站立目标）。
+            //    ⚠️ 动作下发仍由 control 线程的 act_alpha 平滑完成（防跳变）。
+            if (act_mode_.load() == ActMode::PD_STAND) {
+                {
+                    std::unique_lock<std::mutex> lock(act_mutex_);
+                    for (size_t i = 0; i < act_.size(); ++i) {
+                        act_[i] = static_cast<float>(joint_default_angle_[i]);
+                    }
+                }
+                publish_action();
+                mode_lock.unlock();
+                const auto now = std::chrono::steady_clock::now();
+                if (now > next_release) {
+                    const auto missed_periods = (now - next_release) / period;
+                    next_release += period * missed_periods;
+                    if (next_release < now) {
+                        next_release += period;
+                    }
+                }
+                std::this_thread::sleep_until(next_release);
+                continue;
+            }
+
             auto& policy = active_policy();
             robot_->read_imu();
             update_obs_segments(policy.obs_segments, policy.obs_layout);

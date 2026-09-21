@@ -1,0 +1,137 @@
+# DM10 bipedal lower-body deployment config (Damiao DM-J4340-2EC x10, no arms/waist).
+#
+# ⚠️ Channel mapping — CORRECTED 2026-09-17 by live measurement:
+#     can1 = LEFT  leg (ID 1-5)
+#     can2 = RIGHT leg (ID 1-5)
+#
+#   This REPLACES the previous note ("can2 = LEFT, can1 = RIGHT"), which came from
+#   a 2026-09-08 bench session and was WRONG. How it was settled this time: with the
+#   robot suspended and motors DISABLED, one leg was moved by hand while the other
+#   stayed still, and the per-bus readings were diffed (scripts/sample_motors.py):
+#       move RIGHT leg -> can2 changed by 64.6 deg total, can1 changed by 0.00 deg
+#       move LEFT  leg -> can1 changed by 42.8 deg total, can2 changed by 0.00 deg
+#   Both directions of the test were clean, so this is measured, not inferred.
+#   ⚠️ Three documents still say the opposite (this file's old comment, the motor-ID
+#   planning doc, and the 09-08 bench notes). They are all superseded by the above.
+#
+# Joint order l1..l5 (left hip->foot), r1..r5 (right hip->foot) matches the dm10
+# MJCF / UniLab policy order, so urdf2motor is identity.
+# Feedback frames arrive on the Master_ID bus (arbitration ID = 0) and are
+# demultiplexed by the low-nibble motor ID in D0, so master_id_offset stays 0.
+#
+# ⚠️⚠️ MOTOR ID ORDER — CORRECTED 2026-09-17 by live measurement. READ THIS.
+#
+#   The motors were given their CAN IDs deliberately, numbered from the BOTTOM UP:
+#       foot/ankle = 1, knee = 2, hip-roll = 3, hip-yaw = 4, hip-pitch = 5
+#   (Yes, ID=5 is the hip and ID=1 is the ankle — the reverse of the policy's
+#    l1..l5 = hip..foot ordering. This was a deliberate choice, not a mistake.)
+#
+#   `motor_id` is indexed in POLICY JOINT ORDER (l1..l5 = hip..foot), so it must
+#   therefore count DOWN 5..1 per leg. Getting this backwards silently swaps every
+#   joint's meaning: the policy's "hip angle" would actually be the ankle angle, on
+#   both the observation and the action path, with NO error raised (the dimensions
+#   still add up). That is a robot-damaging class of bug, not a cosmetic one.
+#
+#   How it was measured (robot suspended, motors DISABLED, one joint moved by hand
+#   at a time, per-bus readings diffed with scripts/sample_motors.py):
+#       ankle only -> ID 1 moved -47.8 deg; all other 9 joints 0.00 deg
+#       knee  only -> ID 2 moved -84.7 deg  (next largest: -0.7 deg)
+#       hip side-splay  -> ID 3 moved -62.3 deg  (next largest: -1.6 deg)
+#       hip twist       -> ID 4 moved +50.5 deg  (next largest: -2.6 deg)
+#       hip fore/aft    -> ID 5 moved +54.8 deg; the other 4 leg joints ~0
+#   Five for five, strictly monotonic. Note ID=3 "happens to match" the old wrong
+#   order — which is exactly why this had to be measured rather than reasoned about.
+#
+#   ⚠️ `reports/达妙下肢_电机ID规划_权威版.md` claims the opposite (0x05=hip, 0x01=foot,
+#   derived from the vendor's MCU firmware). That document describes the vendor's
+#   reference build; THIS robot was wired/ID'd bottom-up by hand. The measurement wins.
+#
+# ⚠️ `motor_interface` lists buses **in the same order as the joint groups**:
+#   entry 0 carries joints l1..l5 (LEFT), entry 1 carries r1..r5 (RIGHT).
+#   Getting this order wrong silently mislabels the legs
+#   (kp/kd/motor_sign are indexed by list position).
+#
+# ⚠️⚠️ 接口名 — 2026-09-17 改为 can0/can1。原因与依据：
+#
+#   用的是达妙 DM-USB2FDCAN Dual（一个 USB 设备、两个 CAN 通道）。
+#   官方手册（DM-USB2CANFD_Dual V1.0 第 12-13 页）明确：这两个通道在 Linux 下
+#   就是 **can0 和 can1**。本机 DEPLOY_STATUS.md 记录的原始设计也是 can0/can1。
+#
+#   ⚠️ 之前这里写 ["can1","can2"] —— 那是一次【开机时序竞争】的产物：
+#     板载 CAN（spi5.0 tcan4x5x）启动时先拿到 `can0` 号，随后被 udev 规则
+#      改名成 `can4`、把 can0 释放掉（dmesg: "spi5.0 can4: renamed from can0"）。
+#     若 USB 适配器在【释放之前】枚举，它就只能拿到 can1/can2 —— 名字因此会漂。
+#
+#   ✅ 已处理：禁用板载 CAN（它没用）——
+#      · `systemctl disable can4.service`（备份 can4.service.bak-20260917-221224）
+#      · 注释 `/etc/udev/rules.d/98-onboard-can.rules`（备份同名 .bak-…）
+#     ⇒ can0 号不再被抢，USB 适配器稳定拿到 can0/can1。
+#
+#   ⭐ 哪条通道是哪条腿 —— **差分实测**（机器人吊着 + 电机失能，只动一条腿、
+#      差分两条总线读数，只读不使能）：
+#          动【左腿】膝 → can0 变化 −13.75°，can1 全部 0.00°  ⇒ **can0 = 左腿**
+#      ⇒ 所以入口 0 是 can0（左）、入口 1 是 can1（右）。
+#
+#   ⚠️ 物理侧对应：模块 CH1 → can0、CH2 → can1（与官方手册一致）。
+#      若换 USB 口或改接法，需重测 "哪条通道是哪条腿"。
+motors:
+    #                            l1 l2 l3 l4 l5   r1 r2 r3 r4 r5
+    #                            hip ------> foot  hip ------> foot
+    motor_id: [5, 4, 3, 2, 1, 5, 4, 3, 2, 1]
+    motor_interface_type: ["can", "can"]
+    motor_interface: ["can0", "can1"]
+    motor_num: [5, 5]
+    motor_type: ["DM", "DM"]
+    motor_model: [2, 2, 2, 2, 2, 2, 2, 2, 2, 2]   # 2 = DM4340P_24V (SpdMax 6 / TauMax 12)
+    master_id_offset: 0
+    motor_zero_offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+robot:
+    # No `type` field: dm10 legs are serial (no parallel ankle chain), so the
+    # ankle `Decouple` stays null and the close-chain branch is skipped entirely.
+    # Official Damiao running gains (sim2real config.yaml): per leg
+    # kp [16,20,20,18,20], kd 3.0 across all ten.
+    kp: [16, 20, 20, 18, 20, 16, 20, 20, 18, 20]
+    kd: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
+
+    # ⚠️⚠️ 2026-09-17 第二次修正（第一次把 l1 填错了）。以下为【最终实测值】。
+    #
+    #   判据（全部事先定好，不做临时换算）：
+    #     给【电机坐标系 +a】命令，观察物理效果，与模型期望比：
+    #       一致 ⇒ +1 ； 相反 ⇒ −1
+    #   ⚠️ 每一个都逐一目视确认过，而且用的是【最朴素的物理描述】
+    #      （往屁股/往前、伸/收、压/抬、外张/内收），不做"顺/逆时针"这类换算
+    #      —— 本轮实践证明那种换算极易出错。
+    #
+    #   实测记录（can 总线 + 电机 ID ⇒ 你看到的现象 ⇒ 结论）：
+    #     can1:5 左髋pitch  给正 → 大腿【往屁股(后)】   模型期望也是后   ⇒ +1
+    #     can1:2 左膝       给正 → 小腿【往屁股(收)】   模型期望也是收   ⇒ +1
+    #     can1:1 左踝       给正 → 脚尖【向下压】       模型期望也是向下 ⇒ +1
+    #     can1:4 左髋roll   给正 → 腿【往内侧收】       模型期望是外张   ⇒ −1
+    #     can1:3 左髋yaw    给正 → 脚尖【往内侧转】     模型期望是外张   ⇒ −1
+    #     can2:5 右髋pitch  给正 → 大腿【往前】         模型期望是后     ⇒ −1
+    #     can2:2 右膝       给正 → 小腿【往前伸】       模型期望是收     ⇒ −1
+    #     can2:1 右踝       给正 → 脚尖【往上抬】       模型期望是向下   ⇒ −1
+    #     can2:4 右髋roll   给正 → 腿【往外侧张】       模型期望是内收   ⇒ −1
+    #     can2:3 右髋yaw    给正 → 脚尖【往外侧转】     模型期望是内收   ⇒ −1
+    #
+    #   ⭐ 规律（与模型的几何关系【完全自洽】）：
+    #     髋pitch / 膝 / 踝 —— 左右【异号】(左+1 右−1)  模型要求"镜像" ✅
+    #     髋roll  / 髋yaw  —— 左右【同号】(都 −1)      模型要求"同向" ✅
+    #
+    #   ⚠️ 第一次修正时 l1(左髋pitch) 填成了 −1 —— 那样左右同号，与"镜像"矛盾。
+    #      是靠"motor_sign 左右关系 vs 模型镜像/同向"的一致性检验 + 重新逐台目视发现的。
+    #      ⇒ 教训：符号换算最易错，判据必须用【物理描述】而非【角度约定】。
+    #
+    #   ⚠️ 为什么危险：错了【不报错】（维度对得上），但策略会反向驱动关节。
+    motor_sign: [1, -1, -1, 1, 1, -1, -1, -1, -1, -1]
+    #             l1  l2  l3 l4 l5  r1  r2  r3  r4  r5
+    #            髋P 髋R 髋Y 膝 踝  髋P 髋R 髋Y  膝  踝
+    urdf2motor: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+imu:
+    imu_id: 1
+    imu_type: "DM_IMU_L1"
+    imu_interface_type: "serial"
+    imu_interface: "/dev/ttyACM0"
+    baudrate: 921600

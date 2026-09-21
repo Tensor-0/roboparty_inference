@@ -1,0 +1,84 @@
+inference_node:
+    ros__parameters:
+        model_names: ["policy.onnx"]
+        # ⚠️⚠️ 顺序必须与【训练侧的 term 声明顺序】一致（2026-09-17 修）：
+        #   训练侧 unilab/conf/ppo/task/dm10_joystick_flat/base.yaml 的 policy.terms 顺序为
+        #     base_ang_vel(3) → projected_gravity(3) → joint_pos(10) → joint_vel(10)
+        #     → actions(10) → command(3)
+        #   ⇒ 对应这里的 ang_vel(3), gravity_b(3), dof_pos(10), dof_vel(10),
+        #     last_action(10), cmd_vel(3)
+        #
+        #   改前是 "…, cmd_vel:3, dof_pos:10, dof_vel:10, last_action:10"
+        #   —— 前两段（ang_vel/gravity_b）只是【改名不换位】，是对的；
+        #   **真正的错位从第 3 段起**：策略以为的「关节位置」其实是「速度指令」。
+        #
+        #   ⚠️ 为什么危险：两边都是 39 维 ⇒ 部署侧的校验【只比对总元素数】⇒
+        #      **运行时不会报错**，但机器人收到语义错乱的观测。
+        #   ⚠️ 根治：导出 onnx 时 dump「obs 语义清单」并在部署侧比对
+        #      （训练跑完的 run_config.json 里 contract_snapshot['env.observations']
+        #       已逐字保存 term 顺序，部署侧读它即可，不用新写 dump 逻辑）。
+        #
+        #   ✅ 语义已核对：cmd_vel 的顺序与训练侧 UniformVelocityCommand 一致
+        #      （[:,0]=lin_vel_x, [:,1]=lin_vel_y, [:,2]=ang_vel_z），本项无需改。
+        #   ⚠️ 但注意本任务【只在直走上训过】（训练 ranges: lin_vel_x=[0.3,0.5],
+        #      lin_vel_y=0, ang_vel_z=0），而 clip_cmd 给了 ±0.4/±0.8 的余量
+        #      ⇒ 侧移/转向是【分布外】。上机应先只发 vx。
+        obs_layouts:
+          - "ang_vel:3, gravity_b:3, dof_pos:10, dof_vel:10, last_action:10, cmd_vel:3"
+        # UniLab dm10 policy is single-frame (no obs history stacking): the ONNX
+        # model input is [1, 39], so frame_stack MUST be 1 or the deploy runtime
+        # throws "ONNX input size mismatch" (39 * frame_stack != 39).
+        frame_stacks: [1]
+        obs_stack_orders: ["frame_major"]
+        # ⚠️ 2026-09-17 上机前从 1.0 改为 0.8。
+        #   机制（inference_node.cpp:260）：last_act_ = α·act + (1−α)·last_act_
+        #   ⇒ α=1.0 时该机制是 **no-op（完全不平滑）**。
+        #   文档 docs/09-参考/参数速查表.md:173 建议 0.7~0.9（防动作突变冲击）。
+        #   ⚠️ 但这会改变策略行为，而策略是在 α=1.0 下训的。
+        #   ⇒ 取【上限 0.8】（离 1.0 最近），先做小幅平滑。
+        #   ⚠️ 若上机发现动作发飘/跟不上，先改回 1.0 再排查，别先怀疑策略。
+        act_alpha: 0.8
+        joint_num: 10
+        decimation: 5
+        intra_threads: 1
+        dt: 0.004
+        obs_scales_lin_vel: 1.0
+        obs_scales_ang_vel: 1.0
+        obs_scales_dof_pos: 1.0
+        obs_scales_dof_vel: 1.0
+        obs_scales_gravity_b: 1.0
+        clip_observations: 100.0
+        action_scale: [0.25]
+        clip_actions: 18.0
+        # Policy (URDF) joint order -> physical order is identity (l1..l5, r1..r5).
+        usd2urdf: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        clip_cmd:
+            [-0.6, 1.0,
+             -0.4, 0.4,
+             -0.8, 0.8]
+        # Policy REFERENCE FRAME — must stay numerically equal to the MJCF `home`
+        # keyframe in UniLab's dm10 scenes (scene_flat*.xml). On this side it is
+        # consumed in FOUR places:
+        #   obs zero point     obs_manager.cpp:226  (q_measured - joint_default_angle)
+        #   action offset      inference_node.cpp:472 (out*scale + joint_default_angle)
+        #   PD-stand fallback  inference_node.cpp:408
+        #   power-on soft start ros_interface.cpp:474 -> robot_interface.cpp:245
+        # 2026-09-21: changed from the Damiao bent-knee values (l1 -0.4 / l4 +0.8 /
+        # l5 -0.4 per leg) to straight-leg zeros, together with the sim keyframe.
+        # Measured why straight-leg: static hold costs 0.02 N.m peak vs 1.70 N.m
+        # bent, and the leg Jacobian's singularity at knee=0 is VERTICAL — the
+        # direction the structure already carries.
+        # ⚠️ A mismatch in EITHER direction shifts the policy's whole input/output
+        # frame by a constant, so the policy diverges — the two sides must be
+        # changed together, never one at a time.
+        # ⚠️ MUST have exactly 10 elements. joint_default_angle_ is indexed with NO
+        # length validation (unlike action_scale, ros_interface.cpp:93-100), so a
+        # short list is an out-of-bounds read that starts up without complaining.
+        joint_default_angle:
+            [0.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 0.0, 0.0, 0.0]
+        # Joint limits from the dm10 MJCF (l1..l5, r1..r5).
+        joint_limits:
+            [-1.05, 1.05, -0.52, 0.785, -0.52, 0.785, -0.3, 2.3562, -1.047, 0.3,
+             -1.05, 1.05, -0.785, 0.52, -0.785, 0.52, -0.3, 2.3562, -1.047, 0.3]
+        gravity_z_upper: -0.5
