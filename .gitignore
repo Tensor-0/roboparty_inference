@@ -19,3 +19,6 @@ debian/.debhelper/
 # source ignore
 thirdparty/yaml-cpp-0.9.0
 thirdparty/onnxruntime*/
+
+# 手工备份（cp foo foo.bak-<tag>-<date> 的产物）—— 是本机调试痕迹，不是源码
+*.bak-*
