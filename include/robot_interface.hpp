@@ -95,6 +95,17 @@ class RobotInterface {
         std::unique_lock<std::mutex> lock(imu_mutex_);
         return ang_vel_buf_;
     }
+    /// Linear acceleration in body frame (m/s^2), gravity included.
+    /// The DM-IMU-L1 reports ~+9.8 on z when at rest, matching the ROS
+    /// sensor_msgs/Imu convention, so no gravity subtraction is applied here.
+    std::vector<float> get_lin_acc() {
+        if (!imu_) {
+            throw std::runtime_error("IMU is not initialized");
+        }
+        std::unique_lock<std::mutex> lock(imu_mutex_);
+        return lin_acc_buf_;
+    }
+
 
     std::atomic<bool> is_init_{false};
 
@@ -109,6 +120,7 @@ class RobotInterface {
     Eigen::Quaternionf extrinsic_q_inv_ = Eigen::Quaternionf::Identity();
     std::vector<float> quat_buf_{0.f, 0.f, 0.f, 0.f};
     std::vector<float> ang_vel_buf_{0.f, 0.f, 0.f};
+    std::vector<float> lin_acc_buf_{0.f, 0.f, 0.f};
     std::vector<std::shared_ptr<MotorDriver>> motors_;
     std::unique_ptr<ThreadPool> thread_pool_;
     std::vector<size_t> motor_bus_offsets_;

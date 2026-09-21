@@ -152,6 +152,7 @@ void RobotInterface::read_imu() {
     std::unique_lock<std::mutex> lock(imu_mutex_);
     const auto raw_quat = imu_->get_quat();          // w, x, y, z
     const auto raw_ang_vel = imu_->get_ang_vel();  // in IMU frame
+    const auto raw_lin_acc = imu_->get_lin_acc();  // in IMU frame, m/s^2, gravity included
     Eigen::Quaternionf q_body =
         Eigen::Quaternionf(raw_quat[0], raw_quat[1], raw_quat[2], raw_quat[3]) * extrinsic_q_inv_;
     q_body.normalize();
@@ -163,6 +164,8 @@ void RobotInterface::read_imu() {
     quat_buf_[2] = q_body.y();
     quat_buf_[3] = q_body.z();
     Eigen::Map<Eigen::Vector3f>(ang_vel_buf_.data()) = omega_body;
+    Eigen::Map<const Eigen::Vector3f> acc_imu(raw_lin_acc.data());
+    Eigen::Map<Eigen::Vector3f>(lin_acc_buf_.data()) = extrinsic_R_mat_ * acc_imu;
 }
 
 void RobotInterface::apply_action(const std::vector<float>& p,
