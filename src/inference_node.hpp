@@ -23,6 +23,7 @@
 #include <thread>
 #include <utility>          // std::pair —— 前馈表用
 #include <rclcpp/rclcpp.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <sensor_msgs/msg/joy.hpp>
@@ -283,6 +284,7 @@ class InferenceNode : public rclcpp::Node {
     bool temp_cutoff_fired_ = false;   // 失能只做一次
     int64_t last_temp_log_ns_ = 0;     // 每 10 s 报一行最热电机（顺便验证读数是否可信）
     int64_t last_clip_log_ns_ = 0;     // 裁剪日志限速
+    int64_t last_bad_action_log_ns_ = 0;  // 非有限目标日志限速
     // ⭐ 前馈力矩表（2026-09-21）：τ_ff(q) 查表插值。
     //   来源 robot.yaml 的 gravity_feedforward:（那里的注释写了条件与测法）。
     //   ⚠️ 表的条件（悬挂/落地）必须和当前运行条件一致，否则会【系统性地】喂错力矩。
@@ -317,6 +319,34 @@ class InferenceNode : public rclcpp::Node {
     //      不存在误触发；再紧也能调（0 = 关闭）。
     float imu_timeout_s_ = 0.05f;
     bool imu_stale_fired_ = false;                  // 只由 control 线程读写
+
+    // ⭐ 安全注入钩子（2026-09-22）：给 A4 注入测试用，默认全关。
+    //
+    //   为什么需要：有些故障【只能从程序内部发生】——
+    //     · `act_` 是策略在节点内部算出来的，外面没有任何话题能往里塞一个 NaN 或超限值；
+    //     · overrun 是"这一轮没算完"，推理线程是 SCHED_FIFO 35，外面压不垮它。
+    //   没有钩子，这两条安全代码就只能靠读代码验证 —— 而"写了但从不触发"正是
+    //   A1① 那个 NaN 守卫死掉的方式（对 NaN 是空操作，在仓库里躺了四天）。
+    //
+    //   为什么用【参数】而不是话题：`ros2 param set` 要一个字一个字敲，误触发概率最低；
+    //   也不用加 .srv 定义和编译改动。连续值（动作向量）正好能用 double 数组参数表达。
+    //
+    //   ⚠️ 注入值是【替换 act_】，之后和策略动作走完全相同的路（平滑 → 裁剪 → 下发）
+    //      ⇒ 验的是真代码路径，不是旁路。
+    //   ⚠️ 总闸 safety_inject_enabled 默认 false：部署时的启动参数一个字都不用改，
+    //      关着的时候下面两个参数设了也会被参数的 set 回调【拒绝】。
+    bool safety_inject_enabled_ = false;
+    std::vector<double> injected_action_;           // 受 act_mutex_ 保护
+    std::atomic<bool> inject_pending_{false};
+    std::atomic<float> inject_stall_ms_{0.0f};
+    // NaN 单独一个参数，不走"数组里放 nan"：ROS 的 C 版 YAML 解析器吃不下
+    // 数组里的 `.nan`（整条会被当成字符串，param load 报类型错）。
+    // 语义：>=0 ⇒ 只把该关节的 act_ 设成 NaN，其它关节保持原样 ——
+    //       这才是"策略某一个输出变 NaN"的真实样子。
+    std::atomic<int> inject_nan_joint_{-1};
+    OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
+    rcl_interfaces::msg::SetParametersResult on_parameter_change(
+        const std::vector<rclcpp::Parameter>& params);
 
     // 单调时钟纳秒（看门狗不能用 ROS time —— 那是可跳的仿真时间）
     static int64_t steady_ns() {

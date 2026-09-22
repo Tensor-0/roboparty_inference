@@ -3,6 +3,8 @@
 
 #include "inference_node.hpp"
 
+#include <limits>  // quiet_NaN —— 注入用
+
 void InferenceNode::update_obs_history(std::vector<float>& history,
                                        const std::vector<float>& obs,
                                        int obs_num, int frame_stack,
@@ -300,6 +302,10 @@ void InferenceNode::apply_action() {
     }
     bool bad_action = false;
     bool clipped_action = false;
+    bool clip_logged_once = false;
+    int clipped_joint = -1;
+    double clipped_from = 0.0;
+    double clipped_to = 0.0;
     {
         std::unique_lock<std::mutex> lock(act_mutex_);
         // ⭐ PD 目标由【本线程】写（2026-09-22）。
@@ -315,6 +321,21 @@ void InferenceNode::apply_action() {
             for (size_t i = 0; i < act_.size() && i < pd_stand_target_.size(); ++i) {
                 act_[i] = static_cast<float>(pd_stand_target_[i]);
             }
+        }
+        // ⭐ 安全注入（2026-09-22）：放在 PD 目标之后、非有限检查【之前】——
+        //   注入的值必须和非策略来源的值走完全一样的后续处理，否则等于绕过了
+        //   本来要验证的那段代码。只吃一次：每设一次参数注入一个周期。
+        if (inject_pending_.exchange(false)) {
+            for (size_t i = 0; i < act_.size() && i < injected_action_.size(); ++i) {
+                act_[i] = static_cast<float>(injected_action_[i]);
+            }
+        }
+        // ⭐ 注入 NaN（2026-09-22）：只把指定关节设成 NaN、其它保持原样 ——
+        //   这才是"策略某一个输出变 NaN"的真实样子，也正是要验证
+        //   下面那段非有限检查能不能接住它。
+        const int nan_joint = inject_nan_joint_.exchange(-1);
+        if (nan_joint >= 0 && nan_joint < static_cast<int>(act_.size())) {
+            act_[nan_joint] = std::numeric_limits<float>::quiet_NaN();
         }
         // ⭐ 非有限目标（2026-09-22）：策略发散时输出会变 NaN，而 NaN 是【粘住】的
         //   —— clip_actions 对 NaN 是空操作，NaN 经观测 last_action 又喂回网络，
@@ -337,11 +358,18 @@ void InferenceNode::apply_action() {
         //   走到这里说明配置为空（= 原本就不裁）。
         if (joint_limits_.size() == 2 * last_act_.size()) {
             for (size_t j = 0; j < last_act_.size(); ++j) {
-                double target = last_act_[j];
+                const double before = last_act_[j];
+                double target = before;
                 if (safety::clip_joint_target(target, joint_limits_[2 * j],
                                               joint_limits_[2 * j + 1],
                                               safety::kJointLimitMargin)) {
                     clipped_action = true;
+                    if (!clip_logged_once) {  // 记下第一个被裁的关节，供日志用
+                        clip_logged_once = true;
+                        clipped_joint = static_cast<int>(j);
+                        clipped_from = before;
+                        clipped_to = target;
+                    }
                     last_act_[j] = static_cast<float>(target);
                 }
             }
@@ -349,21 +377,30 @@ void InferenceNode::apply_action() {
     }
     // 日志都放在锁外（构造字符串不该占着 act_mutex_）
     if (bad_action) {
-        const bool was_policy = (act_mode_.load() == ActMode::POLICY);
-        switch_to_pd_stand("non-finite action from the policy");
-        if (was_policy) {
+        // ⚠️ 这里不能只在"从策略切过来"时报（上面几处降级是那个写法）：
+        //   非有限值是【数据事件】不是模式迁移 —— PD 模式下同样会发生
+        //   （pd_stand_target 配错、或注入进来的值就是 NaN），
+        //   而那时 act_mode_ 本来就是 PD，按"模式变了没"判会一个字都不打。
+        //   ⇒ 改按时间限速：真的持续坏下去也只会每 2 s 一行。
+        const int64_t now_ns = steady_ns();
+        if (now_ns - last_bad_action_log_ns_ > 2000000000LL) {
+            last_bad_action_log_ns_ = now_ns;
             RCLCPP_ERROR(this->get_logger(),
-                         "策略输出了非有限的目标（NaN/inf）⇒ 切 PD 站立。"
+                         "收到非有限的下发目标（NaN/inf）⇒ 该关节保持上一帧、整体切 PD 站立。"
                          "NaN 会经 last_action 观测自锁，不会自己恢复");
         }
+        switch_to_pd_stand("non-finite action");
     }
     if (clipped_action) {
         const int64_t now_ns = steady_ns();
         if (now_ns - last_clip_log_ns_ > 2000000000LL) {  // 每 2 s 最多一行
             last_clip_log_ns_ = now_ns;
             RCLCPP_WARN(this->get_logger(),
-                        "下发目标被关节限位裁剪（内侧留 %.2f rad）。"
+                        "下发目标被关节限位裁剪：joint %d  %.3f → %.3f rad"
+                        "（限位 [%.3f, %.3f]，内侧留 %.2f）。"
                         "偶发 = 保护生效；常态 = 策略发散或 joint_limits 配错",
+                        clipped_joint, clipped_from, clipped_to,
+                        joint_limits_[2 * clipped_joint], joint_limits_[2 * clipped_joint + 1],
                         safety::kJointLimitMargin);
         }
     }
@@ -404,6 +441,100 @@ void InferenceNode::apply_action() {
 //   且推理线程本身可能就是卡住的那个。
 //   开销：10 次 atomic 读，可忽略；但动作仍要连续 kTempConsecutiveCycles 个周期
 //   才生效，用来滤掉单帧垃圾（温度 100 ms 内不可能真变）。
+// ⭐ 安全注入钩子（2026-09-22）—— A4 用，见头文件里的设计说明。
+//
+//   ⚠️ 这里是【拒绝点】：总闸关着的时候，设 safety_inject_action / stall 会被
+//      参数的 set 回调直接拒掉（ros2 param set 会返回失败原因），而不是静默生效。
+//      "关掉的安全功能"和"根本没有的安全功能"要能区分开 —— 这正是 A1① 的教训。
+rcl_interfaces::msg::SetParametersResult InferenceNode::on_parameter_change(
+    const std::vector<rclcpp::Parameter>& params) {
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
+
+    // ⚠️ 先单独把总闸挑出来算好：同一批里可能既设了总闸又设了注入值，
+    //    而"哪个先"不该影响结果（下面那个循环里再读成员就变成顺序相关了）。
+    // ⚠️ 而且【必须真的把值写回成员】—— 第一版只打了日志没赋值，
+    //    于是运行时开总闸永远开不上（静默不生效）。
+    bool enabled = safety_inject_enabled_;
+    for (const auto& param : params) {
+        if (param.get_name() == "safety_inject_enabled") {
+            enabled = param.as_bool();
+        }
+    }
+    if (enabled != safety_inject_enabled_) {
+        safety_inject_enabled_ = enabled;
+        if (!enabled) {  // 关闸 ⇒ 顺手把还没生效的注入清掉
+            inject_stall_ms_.store(0.0f);
+            inject_pending_.store(false);
+            inject_nan_joint_.store(-1);
+        }
+        RCLCPP_ERROR(this->get_logger(),
+                     "⚠️ safety_inject_enabled -> %s（这之后注入参数才会被接受）",
+                     enabled ? "true" : "false");
+    }
+
+    for (const auto& param : params) {
+        const std::string& name = param.get_name();
+        if (name == "safety_inject_enabled") {
+            continue;  // 上面处理过了
+        }
+        if (name == "safety_inject_action") {
+            if (!enabled) {
+                result.successful = false;
+                result.reason = "safety_inject_enabled is false";
+                return result;
+            }
+            const auto values = param.as_double_array();
+            if (values.size() != static_cast<std::size_t>(joint_num_)) {
+                result.successful = false;
+                result.reason = "safety_inject_action must have exactly " +
+                                std::to_string(joint_num_) + " values, got " +
+                                std::to_string(values.size());
+                return result;
+            }
+            {
+                std::unique_lock<std::mutex> lock(act_mutex_);
+                injected_action_.assign(values.begin(), values.end());
+                inject_pending_.store(true);
+            }
+            std::string rendered;
+            for (const double value : values) {
+                rendered += " " + std::to_string(value);
+            }
+            RCLCPP_ERROR(this->get_logger(),
+                         "⚠️ 安全注入：下一周期 act_ 将被替换为 [%s ]（之后照常走平滑→裁剪→下发）",
+                         rendered.c_str());
+        } else if (name == "safety_inject_nan_joint") {
+            if (!enabled) {
+                result.successful = false;
+                result.reason = "safety_inject_enabled is false";
+                return result;
+            }
+            const int64_t joint = param.as_int();
+            if (joint < -1 || joint >= joint_num_) {
+                result.successful = false;
+                result.reason = "safety_inject_nan_joint must be -1 (off) or a joint index in [0, " +
+                                std::to_string(joint_num_ - 1) + "], got " + std::to_string(joint);
+                return result;
+            }
+            inject_nan_joint_.store(static_cast<int>(joint));
+            RCLCPP_ERROR(this->get_logger(),
+                         "⚠️ 安全注入：下一周期 act_[%ld] 将被设成 NaN", static_cast<long>(joint));
+        } else if (name == "safety_inject_stall_ms") {
+            if (!enabled) {
+                result.successful = false;
+                result.reason = "safety_inject_enabled is false";
+                return result;
+            }
+            const double stall_ms = param.as_double();
+            inject_stall_ms_.store(static_cast<float>(stall_ms));
+            RCLCPP_ERROR(this->get_logger(),
+                         "⚠️ 安全注入：推理循环每周期多睡 %.0f ms（造 overrun）", stall_ms);
+        }
+    }
+    return result;
+}
+
 void InferenceNode::check_motor_temperature() {
     if (!robot_->is_init_.load()) {
         return;
@@ -623,6 +754,14 @@ void InferenceNode::inference() {
             }
 
             auto& policy = active_policy();
+            // ⭐ 安全注入：造 overrun（2026-09-22）
+            //   放在【真正干活的那段】里、PD 分支之后 —— 超时降级只在"策略真的在跑"
+            //   时才有意义，暂停时不该触发（也就无从验证它）。见头文件里的钩子说明。
+            const float stall_ms = inject_stall_ms_.load();
+            if (stall_ms > 0.0f) {
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds(static_cast<long long>(stall_ms * 1000.0f)));
+            }
             robot_->read_imu();
             update_obs_segments(policy.obs_segments, policy.obs_layout);
             publish_imu();

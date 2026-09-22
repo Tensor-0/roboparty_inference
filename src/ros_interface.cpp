@@ -51,6 +51,14 @@ void InferenceNode::load_config() {
     this->declare_parameter<float>("cmd_timeout_s", 1.0);
     // ⭐ IMU 数据陈旧阈值（2026-09-22）。0 = 关闭。见 inference_node.hpp 的说明。
     this->declare_parameter<float>("imu_timeout_s", 0.05);
+    // ⭐ 安全注入钩子（2026-09-22）：A4 注入测试用，默认全关 ——
+    //   部署时的启动参数一个字都不用改，不写就是关。
+    //   ⚠️ 总闸关着时，下面两项即使写了也不生效（会打 WARN），
+    //      运行时用 `ros2 param set` 设会被 set 回调直接拒掉。
+    this->declare_parameter<bool>("safety_inject_enabled", false);
+    this->declare_parameter<std::vector<double>>("safety_inject_action", std::vector<double>{});
+    this->declare_parameter<double>("safety_inject_stall_ms", 0.0);
+    this->declare_parameter<int>("safety_inject_nan_joint", -1);
     // ⭐ PD 站立保底（2026-09-17）：启动模式。默认 pd_stand（安全优先）。
     //   "pd_stand" ⇒ 启动即 PD 站立（不跑策略），要跑策略需显式切（service/手柄）
     //   "policy"   ⇒ 旧行为（启动即跑策略）
@@ -119,7 +127,40 @@ void InferenceNode::load_config() {
     this->get_parameter("gravity_z_upper", gravity_z_upper_);
     this->get_parameter("cmd_timeout_s", cmd_timeout_s_);
     this->get_parameter("imu_timeout_s", imu_timeout_s_);
+    // ⭐ 安全注入钩子（2026-09-22）
+    this->get_parameter("safety_inject_enabled", safety_inject_enabled_);
     {
+        std::vector<double> inject_action;
+        double inject_stall_ms = 0.0;
+        int64_t inject_nan_joint = -1;
+        this->get_parameter("safety_inject_action", inject_action);
+        this->get_parameter("safety_inject_stall_ms", inject_stall_ms);
+        this->get_parameter("safety_inject_nan_joint", inject_nan_joint);
+        // 启动时就带注入值的话，同样过一遍总闸 —— 而且这里必须【说出来】，
+        // 不然"配了没生效"又是一种静默失败。
+        if (safety_inject_enabled_) {
+            if (!inject_action.empty()) {
+                if (inject_action.size() != static_cast<std::size_t>(joint_num_)) {
+                    throw std::runtime_error(
+                        "safety_inject_action must have exactly " + std::to_string(joint_num_) +
+                        " values, but got " + std::to_string(inject_action.size()));
+                }
+                injected_action_ = inject_action;
+                inject_pending_.store(true);
+            }
+            inject_stall_ms_.store(static_cast<float>(inject_stall_ms));
+            if (inject_nan_joint >= 0 && inject_nan_joint < joint_num_) {
+                inject_nan_joint_.store(static_cast<int>(inject_nan_joint));
+            }
+        } else if (!inject_action.empty() || inject_stall_ms > 0.0 || inject_nan_joint >= 0) {
+            RCLCPP_WARN(this->get_logger(),
+                        "safety_inject_* 已配置，但 safety_inject_enabled=false ⇒ 【不生效】");
+        }
+    }
+    param_callback_handle_ = this->add_on_set_parameters_callback(
+        [this](const std::vector<rclcpp::Parameter>& params) {
+            return this->on_parameter_change(params);
+        });    {
         std::string sm = "pd_stand";
         this->get_parameter("start_mode", sm);
         start_mode_policy_ = (sm == "policy");
@@ -382,6 +423,9 @@ void InferenceNode::load_config() {
                 cmd_timeout_s_ > 0.0f ? "" : "  (⚠️ 看门狗已关闭)");
     RCLCPP_INFO(this->get_logger(), "imu_timeout_s: %f%s", imu_timeout_s_,
                 imu_timeout_s_ > 0.0f ? "" : "  (⚠️ IMU 陈旧检测已关闭)");
+    RCLCPP_INFO(this->get_logger(), "safety_inject_enabled: %s",
+                safety_inject_enabled_ ? "true  (⚠️ 注入钩子已打开 —— 只该出现在台架上)"
+                                       : "false");
     RCLCPP_INFO(this->get_logger(), "start_mode: %s",
                 start_mode_policy_ ? "policy" : "pd_stand");
     RCLCPP_INFO(this->get_logger(), "act_mode (initial): %s",

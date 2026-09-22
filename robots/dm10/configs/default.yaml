@@ -109,3 +109,20 @@ inference_node:
         #   实测 IMU ~1000 Hz（1 ms 一帧）⇒ 0.05 s 等于漏 50 帧，不会误触发。
         #   设 0 关闭。
         imu_timeout_s: 0.05
+        # ⭐ 安全注入钩子（2026-09-22）：A4 注入测试用，**默认全关**（不写就是关）。
+        #   为什么要有：有些故障【只能在程序内部发生】—— act_ 是策略内部算出来的，
+        #   外面没有话题能往里塞 NaN；overrun 是推理线程自己慢了，外面压不垮它
+        #   （SCHED_FIFO 35）。没有钩子就只能靠读代码验证，而"写了但从不触发"
+        #   正是 A1① 那个 NaN 守卫死掉的方式。
+        #   用法：
+        #     ros2 param set /inference_node safety_inject_enabled true
+        #     ros2 param set /inference_node safety_inject_action "[nan,0,0,0,0,0,0,0,0,0]"
+        #     ros2 param set /inference_node safety_inject_stall_ms 60    # 造 overrun
+        #   ⚠️ 数组参数用 `ros2 param set` 会被当成字符串拒掉，改用 `ros2 param load <file.yaml>`
+        #      （文件里的键要写 `/inference_node:`）。
+        #   ⚠️ NaN 不走数组：ROS 的 C 版 YAML 解析器吃不下数组里的 `.nan`（整条变字符串）。
+        #      用 `safety_inject_nan_joint: <关节号>` 单独表达。
+        #   注入值【替换 act_】，之后照常走 平滑→裁剪→下发 ⇒ 验的是真代码路径。
+        #   ⚠️ 超限注入会让那个关节真的朝限位走 —— 只在机器人【悬空/有支撑】时用。
+        #   ⚠️ 总闸关着时，设上面两项会被参数回调直接拒掉（不是静默忽略）。
+        safety_inject_enabled: false
