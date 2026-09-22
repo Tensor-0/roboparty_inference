@@ -3,7 +3,8 @@
 
 #include "inference_node.hpp"
 
-#include <limits>  // quiet_NaN —— 注入用
+#include <fstream>  // A3：算配置文件指纹
+#include <limits>   // quiet_NaN —— 注入用
 
 void InferenceNode::update_obs_history(std::vector<float>& history,
                                        const std::vector<float>& obs,
@@ -183,6 +184,165 @@ void InferenceNode::publish_act_mode(const char* prev_mode, const char* new_mode
     std_msgs::msg::String msg;
     msg.data = payload;
     act_mode_publisher_->publish(msg);
+}
+
+// ⭐ A3（2026-09-22）：文件内容指纹。
+//   ⚠️ 这是 FNV-1a 64 位，不是密码学哈希 —— 只用来回答"是不是同一个文件"，
+//      不承担防篡改。节点里不引加密库（为这个引一个 OpenSSL 不划算）。
+//   ⚠️ onnx 的【模型身份】不该用文件哈希：跨导出环境字节会变。
+//      那是【权重指纹】的活（toolkit 的 _trace_policy_provenance.py：按名字排序
+//      initializer 再哈希）。节点只负责把那个值从 sidecar 文件读出来原样报出。
+static std::string fnv1a64_hex(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.good()) {
+        return "MISSING";
+    }
+    uint64_t hash = 1469598103934665603ULL;
+    char buf[4096];
+    while (in.read(buf, sizeof(buf)) || in.gcount() > 0) {
+        for (std::streamsize i = 0; i < in.gcount(); ++i) {
+            hash ^= static_cast<unsigned char>(buf[i]);
+            hash *= 1099511628211ULL;
+        }
+    }
+    std::ostringstream out;
+    out << std::hex << hash;
+    return out.str();
+}
+
+static std::string read_first_line(const std::string& path) {
+    std::ifstream in(path);
+    if (!in.good()) {
+        return "";
+    }
+    std::string line;
+    std::getline(in, line);
+    return line;
+}
+
+void InferenceNode::publish_node_metadata() {
+    if (!node_metadata_publisher_) {
+        return;
+    }
+    const auto quote = [](const std::string& text) { return "\"" + json_escape(text) + "\""; };
+    const auto hex_or_missing = [](const std::string& path) {
+        const std::string h = fnv1a64_hex(path);
+        return h == "MISSING" ? std::string("\"MISSING\"") : "\"" + h + "\"";
+    };
+    const auto numbers = [](const std::vector<double>& values) {
+        std::string out = "[";
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (i > 0) out += ",";
+            out += std::to_string(values[i]);
+        }
+        return out + "]";
+    };
+    const auto strings = [&quote](const std::vector<std::string>& values) {
+        std::string out = "[";
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (i > 0) out += ",";
+            out += quote(values[i]);
+        }
+        return out + "]";
+    };
+
+    // sidecar：由【部署那一步】写的旁挂文件。没有就报 unknown —— 别假装知道。
+    //
+    // ⚠️ 必须顺着软链走到【真文件】再找 sidecar：--symlink-install 只给
+    //    "构建时已存在"的文件建软链，而 GIT_SHA / 权重指纹是部署那一步才写进去的
+    //    ⇒ install 树里根本没有它们的软链（实测报 unknown）。canonical 之后
+    //    路径落在源码树里，那里才是部署脚本真正写文件的地方。
+    std::error_code ec;
+    const auto real_path = [&ec](const std::string& path) {
+        const auto canonical = std::filesystem::canonical(path, ec);
+        if (ec) {
+            ec.clear();
+            return std::filesystem::path(path);
+        }
+        return canonical;
+    };
+    const std::string model_path = policies_.empty() ? "" : policies_[0].model_path;
+    const std::filesystem::path real_model = real_path(model_path);
+    const std::filesystem::path real_config = real_path(robot_config_path_);
+    const std::string fingerprint = model_path.empty()
+        ? "" : read_first_line(real_model.string() + ".weight_fingerprint");
+    const std::filesystem::path package_root =
+        real_config.parent_path().parent_path().parent_path();
+    const std::string git_sha = read_first_line((package_root / "GIT_SHA").string());
+
+    // obs 布局从【解析后的 policy】渲染，不存原文 —— 报出来的就是真正在用的那个布局
+    std::vector<std::string> layouts;
+    std::vector<std::string> stacks;
+    std::vector<std::string> orders;
+    for (const PolicyRuntime& policy : policies_) {
+        std::string layout;
+        for (const ObsSourceSpec& spec : policy.obs_layout) {
+            if (!layout.empty()) layout += ", ";
+            layout += spec.name + ":" + std::to_string(spec.size);
+        }
+        layouts.push_back(layout);
+        stacks.push_back(std::to_string(policy.frame_stack));
+        orders.push_back(policy.stack_order == ObsStackOrder::FrameMajor ? "frame_major"
+                                                                         : "obs_major");
+    }
+
+    std::vector<std::pair<std::string, std::string>> items = {
+        {"stamp_ns", std::to_string(this->now().nanoseconds())},
+        {"robot_name", quote(robot_name_)},
+        {"policy_name", quote(policy_name_)},
+        {"robot_config", quote(real_config.string())},
+        {"robot_config_fnv1a64", hex_or_missing(real_config.string())},
+        {"policy_config", quote(policy_config_path_.empty()
+                                    ? "" : real_path(policy_config_path_).string())},
+        {"policy_config_fnv1a64", policy_config_path_.empty()
+                                      ? "\"MISSING\""
+                                      : hex_or_missing(real_path(policy_config_path_).string())},
+        {"onnx", quote(real_model.string())},
+        // ⚠️ file_size 对不存在的文件会抛 —— 元数据不该把节点搞崩
+        {"onnx_bytes", std::to_string(
+             (!model_path.empty() && std::filesystem::exists(real_model))
+                 ? static_cast<long long>(std::filesystem::file_size(real_model)) : 0)},
+        {"onnx_weight_fingerprint", quote(fingerprint.empty() ? "unknown" : fingerprint)},
+        {"git_sha", quote(git_sha.empty() ? "unknown" : git_sha)},
+        // 生效参数（override 之后）—— 离线回放要的就是这些，文件里的值不算数
+        {"joint_default_angle", numbers(joint_default_angle_)},
+        {"pd_stand_target", numbers(pd_stand_target_)},
+        {"joint_limits", numbers(joint_limits_)},
+        {"action_scale", numbers(action_scale_)},
+        {"clip_cmd", numbers(clip_cmd_)},
+        {"obs_layouts", strings(layouts)},
+        {"frame_stacks", strings(stacks)},
+        {"obs_stack_orders", strings(orders)},
+        {"usd2urdf", numbers(std::vector<double>(usd2urdf_.begin(), usd2urdf_.end()))},
+        {"clip_actions", std::to_string(clip_actions_)},
+        {"clip_observations", std::to_string(clip_observations_)},
+        {"action_rescale", std::to_string(action_rescale_)},
+        {"act_alpha", std::to_string(act_alpha_)},
+        {"dt", std::to_string(dt_)},
+        {"decimation", std::to_string(decimation_)},
+        {"gravity_z_upper", std::to_string(gravity_z_upper_)},
+        {"cmd_timeout_s", std::to_string(cmd_timeout_s_)},
+        {"imu_timeout_s", std::to_string(imu_timeout_s_)},
+        {"motor_temp_warn_c", std::to_string(temp_warn_c_)},
+        {"motor_temp_cutoff_c", std::to_string(temp_cutoff_c_)},
+        {"start_mode", quote(start_mode_policy_ ? "policy" : "pd_stand")},
+        {"safety_inject_enabled", safety_inject_enabled_ ? "true" : "false"},
+    };
+
+    std::string payload = "{";
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i > 0) payload += ",";
+        payload += quote(items[i].first) + ":" + items[i].second;
+    }
+    payload += "}";
+    std_msgs::msg::String msg;
+    msg.data = payload;
+    node_metadata_publisher_->publish(msg);
+    RCLCPP_INFO(this->get_logger(),
+                "node metadata: git_sha=%s onnx_fingerprint=%s robot_config_fnv=%s",
+                git_sha.empty() ? "unknown" : git_sha.c_str(),
+                fingerprint.empty() ? "unknown" : fingerprint.c_str(),
+                fnv1a64_hex(real_config.string()).c_str());
 }
 
 void InferenceNode::switch_to_pd_stand(const char* reason, const std::string& detail) {

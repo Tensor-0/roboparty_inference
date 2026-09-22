@@ -22,3 +22,6 @@ thirdparty/onnxruntime*/
 
 # 手工备份（cp foo foo.bak-<tag>-<date> 的产物）—— 是本机调试痕迹，不是源码
 *.bak-*
+
+# 部署那一步写的运行时身份（不是源码）
+GIT_SHA

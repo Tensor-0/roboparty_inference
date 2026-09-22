@@ -168,6 +168,11 @@ class InferenceNode : public rclcpp::Node {
         act_mode_publisher_ =
             this->create_publisher<std_msgs::msg::String>("/act_mode", event_qos);
         publish_act_mode("", start_mode_policy_ ? "POLICY" : "PD_STAND", "startup", "");
+        // ⭐ A3（2026-09-22）：运行时身份。和 /act_mode 一样 transient_local ——
+        //   录包的人中途接上也能立刻知道"这段录像是拿什么跑出来的"。
+        node_metadata_publisher_ =
+            this->create_publisher<std_msgs::msg::String>("/node_metadata", event_qos);
+        publish_node_metadata();
         imu_publisher_ =
             this->create_publisher<sensor_msgs::msg::Imu>("/imu", data_qos);
         joint_state_publisher_ =
@@ -236,6 +241,10 @@ class InferenceNode : public rclcpp::Node {
                           const std::string& reason, const std::string& detail);
     void switch_to_pd_stand(const char* reason, const std::string& detail = "");
     void switch_to_policy();
+    // ⭐ A3（2026-09-22）：把"这段录像是拿什么跑出来的"随 bag 一起留下来。
+    //   为什么要有：事后拿到一段录像，第一个问题永远是"这是哪个配置/哪个 onnx/哪版代码"。
+    //   ⚠️ 报的是【生效值】（override 之后），不是文件里的值 —— 两者在板上常常不同。
+    void publish_node_metadata();
     ActMode act_mode() const { return act_mode_.load(); }
    private:
     std::shared_ptr<RobotInterface> robot_;
@@ -243,6 +252,8 @@ class InferenceNode : public rclcpp::Node {
     std::atomic<ActMode> act_mode_{ActMode::PD_STAND};   // ⭐ 默认安全
     bool start_mode_policy_ = false;                     // 启动参数（yaml start_mode: policy 时为 true）
     std::string robot_config_path_;
+    std::string robot_name_;          // ⭐ A3：元数据里要报（从参数读，不在局部变量里）
+    std::string policy_name_;         // ⭐ A3
     std::string perception_obs_topic_;
     size_t current_motion_policy_idx_ = 0;
     int active_policy_idx_ = 0;
@@ -258,6 +269,8 @@ class InferenceNode : public rclcpp::Node {
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_subscription_;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr action_publisher_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr act_mode_publisher_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr node_metadata_publisher_;
+    std::string policy_config_path_;   // ⭐ A3：policy yaml 的路径（launch 传进来，供哈希用）
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_publisher_;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_publisher_;
     rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr clear_depth_history_client_;

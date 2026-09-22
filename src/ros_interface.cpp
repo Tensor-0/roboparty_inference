@@ -10,6 +10,8 @@ void InferenceNode::load_config() {
     const std::string default_robot_dir = std::string(ROOT_DIR) + "robots/rpo";
     this->declare_parameter<std::string>("robot_name", "rpo");
     this->declare_parameter<std::string>("policy_name", "default");
+    // ⭐ A3：policy yaml 的路径（launch 传）—— 元数据里要拿它算哈希
+    this->declare_parameter<std::string>("policy_config", "");
     this->declare_parameter<std::string>("robot_config", default_robot_dir + "/robot.yaml");
     this->declare_parameter<std::string>("model_dir", default_robot_dir + "/models");
     this->declare_parameter<std::string>("motion_dir", default_robot_dir + "/motions");
@@ -71,13 +73,12 @@ void InferenceNode::load_config() {
     std::vector<std::string> obs_layouts;
     std::vector<long int> frame_stacks;
     std::vector<std::string> obs_stack_orders;
-    std::string robot_name;
-    std::string policy_name;
     std::string model_dir;
     std::string motion_dir;
     std::string latent_dir;
-    this->get_parameter("robot_name", robot_name);
-    this->get_parameter("policy_name", policy_name);
+    this->get_parameter("robot_name", robot_name_);
+    this->get_parameter("policy_name", policy_name_);
+    this->get_parameter("policy_config", policy_config_path_);
     this->get_parameter("robot_config", robot_config_path_);
     this->get_parameter("model_dir", model_dir);
     this->get_parameter("motion_dir", motion_dir);
@@ -379,8 +380,8 @@ void InferenceNode::load_config() {
         policies_.push_back(std::move(policy));
     }
 
-    RCLCPP_INFO(this->get_logger(), "robot_name: %s", robot_name.c_str());
-    RCLCPP_INFO(this->get_logger(), "policy_name: %s", policy_name.c_str());
+    RCLCPP_INFO(this->get_logger(), "robot_name: %s", robot_name_.c_str());
+    RCLCPP_INFO(this->get_logger(), "policy_name: %s", policy_name_.c_str());
     RCLCPP_INFO(this->get_logger(), "robot_config: %s", robot_config_path_.c_str());
     RCLCPP_INFO(this->get_logger(), "model_dir: %s", model_dir.c_str());
     RCLCPP_INFO(this->get_logger(), "motion_dir: %s", motion_dir.c_str());

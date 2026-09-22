@@ -45,6 +45,9 @@ def launch_setup(context, *args, **kwargs):
                 {
                     "robot_name": robot,
                     "policy_name": policy,
+                    # ⭐ A3：policy yaml 的路径也传进去 —— 节点要拿它算指纹，
+                    #   好让录下来的 bag 自带"这段是用哪份配置跑的"。
+                    "policy_config": policy_config,
                     "robot_config": robot_config,
                     "model_dir": os.path.join(robot_dir, "models"),
                     "motion_dir": os.path.join(robot_dir, "motions"),
