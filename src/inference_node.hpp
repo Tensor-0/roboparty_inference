@@ -264,6 +264,28 @@ class InferenceNode : public rclcpp::Node {
     std::vector<float> ff_tau_;                                     // 本周期算出的 τ_ff（关节坐标）
     std::vector<long int> usd2urdf_;
     float gravity_z_upper_;
+    // ⭐ 指令看门狗（2026-09-22）：手柄 / `/cmd_vel` 断线时，机器人会【保持最后一条
+    //   速度指令继续走】—— 全仓原本没有任何超时（已知限制 #8）。
+    //   这里记录最后一次收到指令的时刻，超过 cmd_timeout_s_ 就切 PD 站立。
+    //
+    //   ⚠️ 为什么是【切 PD】而不是【把速度清零】：
+    //      训练只喂过 vx ∈ [0.3, 0.5]、`rel_standing_envs: 0.0`
+    //      ⇒ 策略【从没见过零命令】，清零反而是分布外，行为不可预测。
+    //      切 PD 是绕开策略、走已知可用的那条兜底。
+    //   ⚠️ 默认取 1.0 而不是 0.5：误触发的代价是【行走中途突然切 PD】，
+    //      而漏触发的代价只是"晚半秒刹车"。且工具箱里有以低频发 `/cmd_vel`
+    //      的脚本（如 sweep_cmd_vx.py），0.5 s 会把正常发帧当成断线。
+    //      跑通一次、确认不误触发之后再收到 0.5；用脚本低频驱动时设 0。
+    float cmd_timeout_s_ = 1.0f;
+    std::atomic<int64_t> last_cmd_vel_ns_{0};       // steady_clock 纳秒
+    std::atomic<bool> cmd_watchdog_fired_{false};   // 只在状态翻转时打日志，不刷屏
+
+    // 单调时钟纳秒（看门狗不能用 ROS time —— 那是可跳的仿真时间）
+    static int64_t steady_ns() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
     int last_button0_ = 0, last_button1_ = 0, last_button2_ = 0, last_button3_ = 0, last_button4_ = 0, last_button5_ = 0;
     std::vector<PolicyRuntime> policies_;
     std::vector<int> motion_policy_indices_;

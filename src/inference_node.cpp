@@ -349,13 +349,42 @@ void InferenceNode::control() {
                     auto q = robot_->get_quat();
                     Eigen::Quaternionf q_b2w(q[0], q[1], q[2], q[3]);
                     Eigen::Vector3f g_b = q_b2w.inverse() * Eigen::Vector3f(0.0f, 0.0f, -1.0f);
-                    // ⚠️ NaN 检查：IMU 掉线时四元数会全 0 → NaN，而 NaN > 阈值恒 false
-                    //    ⇒ 会静默失去保护（已知限制 #1）。这里显式拦。
-                    if (std::isfinite(g_b.z()) && g_b.z() > gravity_z_upper_) {
-                        switch_to_pd_stand("fall detected (gravity_b.z > threshold)");
+                    // ⚠️ NaN 检查：IMU 掉线时四元数会全 0 → 归一化出 NaN
+                    //    ⇒ 必须【主动切 PD】，因为这时策略的 gravity_b / ang_vel
+                    //      也全是 NaN，等于瞎了。
+                    //
+                    // 🔴 2026-09-22 修：原来写的是 `isfinite(x) && x > T` ——
+                    //    对 NaN 完全无效（isfinite(NaN)=false，而 NaN>T 本来也是
+                    //    false，加不加守卫行为一样）；对 +∞ 更糟（没守卫时会触发，
+                    //    加了反而挡住）。2026-09-21 a3e1519 引入，一直是空操作。
+                    //    正解是【取反、用 ||】：非有限值 ⇒ 也要切。
+                    if (!std::isfinite(g_b.z()) || g_b.z() > gravity_z_upper_) {
+                        switch_to_pd_stand(std::isfinite(g_b.z())
+                                               ? "fall detected (gravity_b.z > threshold)"
+                                               : "IMU invalid (gravity_b.z not finite)");
                     }
                 } catch (const std::exception& e) {
                     switch_to_pd_stand("IMU read failed in safety check");
+                }
+
+                // ⭐ 指令看门狗（2026-09-22）：手柄 / `/cmd_vel` 断线 ⇒ 切 PD 站立。
+                //    原来【完全没有超时】⇒ 手柄蓝牙一断，机器人保持最后一条速度
+                //    指令继续走（已知限制 #8）。
+                //    ⚠️ 不把速度清零：策略只见过 vx∈[0.3,0.5]，清零是分布外。
+                //    切 PD 后 act_mode_ 变了，上面的 if 会把这段整个跳过 ⇒ 只触发一次。
+                const int64_t last_cmd = last_cmd_vel_ns_.load(std::memory_order_relaxed);
+                if (cmd_timeout_s_ > 0.0f && last_cmd > 0) {
+                    const double age_s = static_cast<double>(steady_ns() - last_cmd) * 1e-9;
+                    if (age_s > cmd_timeout_s_) {
+                        if (!cmd_watchdog_fired_.exchange(true)) {
+                            RCLCPP_ERROR(this->get_logger(),
+                                         "cmd watchdog: 指令已停 %.2f s (> %.2f s) ⇒ 切 PD 站立",
+                                         age_s, cmd_timeout_s_);
+                        }
+                        switch_to_pd_stand("cmd timeout (joystick / cmd_vel silent)");
+                    } else {
+                        cmd_watchdog_fired_.store(false, std::memory_order_relaxed);
+                    }
                 }
             }
             apply_action();

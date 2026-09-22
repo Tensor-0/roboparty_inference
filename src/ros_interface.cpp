@@ -42,6 +42,8 @@ void InferenceNode::load_config() {
     this->declare_parameter<std::vector<double>>("joint_default_angle", std::vector<double>{});
     this->declare_parameter<std::vector<double>>("joint_limits", std::vector<double>{});
     this->declare_parameter<float>("gravity_z_upper", -0.5);
+    // ⭐ 指令看门狗超时（2026-09-22）。0 = 关闭。见 inference_node.hpp 的说明。
+    this->declare_parameter<float>("cmd_timeout_s", 1.0);
     // ⭐ PD 站立保底（2026-09-17）：启动模式。默认 pd_stand（安全优先）。
     //   "pd_stand" ⇒ 启动即 PD 站立（不跑策略），要跑策略需显式切（service/手柄）
     //   "policy"   ⇒ 旧行为（启动即跑策略）
@@ -105,6 +107,7 @@ void InferenceNode::load_config() {
     this->get_parameter("joint_default_angle", joint_default_angle_);
     this->get_parameter("joint_limits", joint_limits_);
     this->get_parameter("gravity_z_upper", gravity_z_upper_);
+    this->get_parameter("cmd_timeout_s", cmd_timeout_s_);
     {
         std::string sm = "pd_stand";
         this->get_parameter("start_mode", sm);
@@ -304,6 +307,8 @@ void InferenceNode::load_config() {
     print_vector<double>("joint_default_angle", joint_default_angle_);
     print_vector<double>("joint_limits", joint_limits_);
     RCLCPP_INFO(this->get_logger(), "gravity_z_upper: %f", gravity_z_upper_);
+    RCLCPP_INFO(this->get_logger(), "cmd_timeout_s: %f%s", cmd_timeout_s_,
+                cmd_timeout_s_ > 0.0f ? "" : "  (⚠️ 看门狗已关闭)");
     RCLCPP_INFO(this->get_logger(), "start_mode: %s",
                 start_mode_policy_ ? "policy" : "pd_stand");
     RCLCPP_INFO(this->get_logger(), "act_mode (initial): %s",
@@ -388,6 +393,8 @@ void InferenceNode::update_feedforward(const std::vector<float>& q_des) {
 void InferenceNode::subs_joy_callback(const std::shared_ptr<sensor_msgs::msg::Joy> msg) {
     if (is_joy_control_){
         std::unique_lock<std::mutex> lock(cmd_mutex_);
+        // ⭐ 指令看门狗：只有【当前控制源】才打时间戳（否则另一个话题会掩盖断线）
+        last_cmd_vel_ns_.store(steady_ns(), std::memory_order_relaxed);
         cmd_vel_[0] = std::clamp(msg->axes[4] * clip_cmd_[1], clip_cmd_[0], clip_cmd_[1]);
         cmd_vel_[1] = std::clamp(msg->axes[3] * clip_cmd_[3], clip_cmd_[2], clip_cmd_[3]);
             if (msg->axes[2] < 0) {
@@ -506,6 +513,8 @@ void InferenceNode::subs_joy_callback(const std::shared_ptr<sensor_msgs::msg::Jo
 void InferenceNode::subs_cmd_callback(const std::shared_ptr<geometry_msgs::msg::Twist> msg){
     if(!is_joy_control_){
         std::unique_lock<std::mutex> lock(cmd_mutex_);
+        // ⭐ 指令看门狗：只有【当前控制源】才打时间戳
+        last_cmd_vel_ns_.store(steady_ns(), std::memory_order_relaxed);
         cmd_vel_[0] = std::clamp(msg->linear.x, clip_cmd_[0], clip_cmd_[1]);
         cmd_vel_[1] = std::clamp(msg->linear.y, clip_cmd_[2], clip_cmd_[3]);
         cmd_vel_[2] = std::clamp(msg->angular.z, clip_cmd_[4], clip_cmd_[5]);
