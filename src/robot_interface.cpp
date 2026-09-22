@@ -381,11 +381,12 @@ void RobotInterface::clear_errors() {
 //           本来就 ≤ 7 ⇒ 它永远是初值 0，判不了"使能"这件事。
 //           （memory: dm-driver-error-id-bug，这个坑踩过）
 //
-//     ② 存活。refresh 之后有没有回复 —— 用 response_count_ == 0 判，重试 3 轮。
+//     ② 存活。每台【单独】refresh，等 60 ms 看有没有回复，最多 3 轮。
 //        和运行时离线判定是同一个原语：每收到一帧就清零，且【先按电机 ID 过滤】
 //        （dm_motor_driver.cpp:224-229），别的电机的回复不算数。
 //        ⚠️ 这里不能用 offline_threshold_（25）当阈值：init 才发了几帧，
-//           拿 25 当阈值等于没检查；也不能只探一轮 —— 见下面 kProbeRounds 的实测记录。
+//           拿 25 当阈值等于没检查。
+//        ⚠️ 也不能"一次把多台都刷了再看" —— 见下面 kProbeAttempts 处的实测记录。
 //        ⚠️ CANFD 的一条 MIT 帧由总线上的 0 号电机代发，所以运行时那个
 //           offline_threshold_ 判定对同总线其它电机是失效的；但 refresh 是
 //           【每台电机各发一帧】的，所以这里的探针对 CAN 和 CANFD 都成立。
@@ -429,36 +430,40 @@ void RobotInterface::init_motors() {
     });
 
     if (failures.empty()) {
-        // ⭐ 存活探针（2026-09-22）：refresh 之后有没有回复。
-        //   ⚠️ 实测（2026-09-22，真机第一次使能）：单轮 50 ms 会【假阳性】——
-        //      10 台里 8 台秒回，右腿 id=3/id=4 在刚跑完 init 序列那一刻晚回，
-        //      于是整个 init 被拒。而逐台单独刷、间隔 60 ms 时 10/10 都正常。
-        //      ⇒ 假阳性的代价是"机器人根本没法上电"，所以这里必须重试。
-        //      判据不变（真死的电机每一轮都不会回），只是不拿单次慢回当事。
-        constexpr int kProbeRounds = 3;
-        constexpr int kProbeRoundMs = 60;
-        std::vector<bool> answered(motors_.size(), false);
-        for (int round = 0; round < kProbeRounds; ++round) {
-            exec_motors_parallel([&](std::shared_ptr<MotorDriver>& motor, int idx) {
-                if (!answered[static_cast<size_t>(idx)]) {
-                    motor->refresh_motor_status();
-                }
-            });
-            std::this_thread::sleep_for(std::chrono::milliseconds(kProbeRoundMs));
-            exec_motors_parallel([&](std::shared_ptr<MotorDriver>& motor, int idx) {
+        // ⭐ 存活探针（2026-09-22，第二版：逐台 + 短窗口 + 重试）
+        //
+        //   为什么不是"一次把 5 台都刷了、等 50 ms 再看"：
+        //   2026-09-22 真机上那版【反复假阳性】—— 10 台里总有两台报没回复，
+        //   而且每次换一对、还换一条总线（先是 can1 的 id=3/4，再是 can0 的 id=3/4）。
+        //   同一时刻 CAN 层是干净的（ERROR-ACTIVE、错误计数全 0），
+        //   慢速逐台探（每台单独刷、间隔 60 ms）则 10/10 稳定有回复。
+        //   ⇒ 是探法太急，不是电机坏了。假阳性的代价是"机器人根本没法上电"。
+        //
+        //   现在按实测可靠的那个节奏来：每台单独刷、等 60 ms、最多 3 轮。
+        //   真死的电机三轮都不会回 ⇒ 判据没松，只是不拿单次慢回当事。
+        //   开销：每总线 5 台 × 60 ms ≈ 300 ms（两条总线并行）。
+        constexpr int kProbeAttempts = 3;
+        constexpr int kProbeWindowMs = 60;
+        // ⚠️ 用 vector<char> 而不是 vector<bool>：后者是【位压缩】的，
+        //    两条总线各跑一个线程、往不同下标写，会落在同一个字上 ⇒ 丢更新
+        //    ⇒ 明明有回复的电机被记成没回复（实测 10 台里随机挂 4 台，
+        //    而单台实验和逐台脚本探针都是 10/10 正常）。
+        std::vector<char> answered(motors_.size(), 0);
+        exec_motors_parallel([&](std::shared_ptr<MotorDriver>& motor, int idx) {
+            const size_t i = static_cast<size_t>(idx);
+            for (int attempt = 0; attempt < kProbeAttempts && !answered[i]; ++attempt) {
+                motor->refresh_motor_status();
+                std::this_thread::sleep_for(std::chrono::milliseconds(kProbeWindowMs));
                 if (motor->get_response_count() == 0) {
-                    answered[static_cast<size_t>(idx)] = true;
+                    answered[i] = 1;
                 }
-            });
-            if (std::all_of(answered.begin(), answered.end(), [](bool ok) { return ok; })) {
-                break;
             }
-        }
+        });
         for (size_t idx = 0; idx < motors_.size(); ++idx) {
             if (!answered[idx]) {
                 std::lock_guard<std::mutex> lock(failures_mutex);
                 failures.push_back(describe_motor(idx) + ": no reply after " +
-                                   std::to_string(kProbeRounds) + " refreshes");
+                                   std::to_string(kProbeAttempts) + " refreshes");
             }
         }
     }
