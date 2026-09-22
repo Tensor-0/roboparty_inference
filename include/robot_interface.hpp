@@ -119,6 +119,19 @@ class RobotInterface {
     bool motors_offline() const;
     std::string offline_motor_list() const;
 
+    // ⭐ 温度监控（2026-09-22）：和 motors_offline() 同一类东西 ——
+    //   热路径（control 线程 250Hz）用的只读查询，不抛、不加锁。
+    //   ⚠️ 单位就是电机反馈里那个数：DM 协议反馈帧 byte7 = 线圈温度（℃）。
+    //      没收到过帧的电机读到 0 ⇒ 表现只会是"最大值偏小"，不会误报过热。
+    float max_motor_temperature() const;
+    std::string hot_motor_list(float limit) const;
+
+    // ⭐ IMU 数据新鲜度（2026-09-22）：见 src/imu/include/imu_driver.hpp 的说明。
+    //   返回【秒】；< 0 表示一帧都还没收到过 —— 那不是"陈旧"，由 NaN 守卫负责，
+    //   调用方要区分这两种情况。
+    //   同样是只读 atomic、不加锁，热路径可每周期调用。
+    float imu_data_age_s() const;
+
     std::atomic<bool> is_init_{false};
 
    private:

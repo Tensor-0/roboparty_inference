@@ -30,6 +30,7 @@
 #include <std_msgs/msg/float32_multi_array.hpp> 
 #include "utils/motion_loader.hpp"
 #include "utils/latent_loader.hpp"
+#include "utils/safety_clip.hpp"
 #include <std_srvs/srv/trigger.hpp>
 #include "robot_interface.hpp"
 
@@ -256,6 +257,32 @@ class InferenceNode : public rclcpp::Node {
     float clip_actions_;
     float action_rescale_ = 1.0f;
     std::vector<double> action_scale_, clip_cmd_, joint_default_angle_, joint_limits_;
+
+    // ⭐ PD 站立目标（2026-09-22）：和 joint_default_angle_ 分开，因为这是两件事。
+    //   joint_default_angle_ = 【策略的参考系】：必须与 sim 的 home keyframe 逐位相等
+    //     （obs 零点 / 动作偏置 / 上电软启动都读它），单边改会让策略整体平移。
+    //   pd_stand_target_     = 【保底要摆成的姿态】：只求落地能站住，
+    //     与策略是屈膝还是直腿无关 —— 这两件事迟早会分叉，绑在一起就改不动。
+    //   ⚠️ 留空 = 沿用 joint_default_angle_ ⇒ 与原行为逐位一致。
+    std::vector<double> pd_stand_target_;
+
+    // ⭐ 温度轮询（2026-09-22）：线圈温度，取的是 DM 反馈帧 byte7
+    //   （dm_motor_driver.cpp:251）。80 ℃ 停策略切 PD、90 ℃ 失能，0 = 关闭该项。
+    //   ⚠️ 阈值要连续 kTempConsecutiveCycles 个周期（100 ms）都超才动作 ——
+    //      温度不可能在 100 ms 里真变，连续计数滤掉的是单帧垃圾。
+    float temp_warn_c_ = 80.0f;
+    float temp_cutoff_c_ = 90.0f;
+    static constexpr int kTempConsecutiveCycles = 25;   // 25 × dt(4ms) = 100 ms
+    // ⭐ 推理超时降级（2026-09-22）：连续这么多次 overrun 就切 PD。
+    //   5 × 20 ms（dt × decimation）= 100 ms —— 一次卡顿不切，持续卡就切。
+    static constexpr int kOverrunStreakToPd = 5;
+
+    // ↓ 以下计数器【只由 control 线程读写】（overrun 那个在 inference 线程的局部变量里）
+    int temp_warn_cycles_ = 0;
+    int temp_cutoff_cycles_ = 0;
+    bool temp_cutoff_fired_ = false;   // 失能只做一次
+    int64_t last_temp_log_ns_ = 0;     // 每 10 s 报一行最热电机（顺便验证读数是否可信）
+    int64_t last_clip_log_ns_ = 0;     // 裁剪日志限速
     // ⭐ 前馈力矩表（2026-09-21）：τ_ff(q) 查表插值。
     //   来源 robot.yaml 的 gravity_feedforward:（那里的注释写了条件与测法）。
     //   ⚠️ 表的条件（悬挂/落地）必须和当前运行条件一致，否则会【系统性地】喂错力矩。
@@ -279,6 +306,17 @@ class InferenceNode : public rclcpp::Node {
     float cmd_timeout_s_ = 1.0f;
     std::atomic<int64_t> last_cmd_vel_ns_{0};       // steady_clock 纳秒
     std::atomic<bool> cmd_watchdog_fired_{false};   // 只在状态翻转时打日志，不刷屏
+
+    // ⭐ IMU 数据陈旧降级（2026-09-22）
+    //   串口断掉之后 get_quat() 会一直返回【最后一帧的缓存值】：不抛异常、不是 NaN，
+    //   所以 A1① 那个 NaN 守卫根本不触发，而策略拿的是不动的姿态继续走。
+    //   2026-09-22 台架实测：拔线后四元数 176 秒一字不差、驱动零报错、RX 线程还吃满一个核。
+    //   ⚠️ 判"驱动还有没有在收帧"（时间戳由驱动盖），不是判"数值有没有变"
+    //      —— 静止时数值本来就可能连续几帧完全相同，那样会误触发。
+    //   ⚠️ 默认 0.05 s：实测 IMU 是 ~1000 Hz（1 ms 一帧），50 ms = 漏 50 帧，
+    //      不存在误触发；再紧也能调（0 = 关闭）。
+    float imu_timeout_s_ = 0.05f;
+    bool imu_stale_fired_ = false;                  // 只由 control 线程读写
 
     // 单调时钟纳秒（看门狗不能用 ROS time —— 那是可跳的仿真时间）
     static int64_t steady_ns() {
@@ -310,6 +348,7 @@ class InferenceNode : public rclcpp::Node {
     void load_config();
     void load_feedforward_table();
     void update_feedforward(const std::vector<float>& q_des);
+    void check_motor_temperature();
     void setup_model(std::unique_ptr<ModelContext>& ctx, std::string model_path, int input_size);
 
     // Policy/model runtime helpers.

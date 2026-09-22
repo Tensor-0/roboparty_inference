@@ -41,9 +41,16 @@ void InferenceNode::load_config() {
         "clip_cmd", std::vector<double>{-0.4, 0.6, -0.4, 0.4, -0.8, 0.8});
     this->declare_parameter<std::vector<double>>("joint_default_angle", std::vector<double>{});
     this->declare_parameter<std::vector<double>>("joint_limits", std::vector<double>{});
+    // ⭐ PD 站立目标（2026-09-22）。留空 = 用 joint_default_angle（原行为）。
+    this->declare_parameter<std::vector<double>>("pd_stand_target", std::vector<double>{});
+    // ⭐ 温度阈值（2026-09-22），0 = 关闭该项。
+    this->declare_parameter<float>("motor_temp_warn_c", 80.0);
+    this->declare_parameter<float>("motor_temp_cutoff_c", 90.0);
     this->declare_parameter<float>("gravity_z_upper", -0.5);
     // ⭐ 指令看门狗超时（2026-09-22）。0 = 关闭。见 inference_node.hpp 的说明。
     this->declare_parameter<float>("cmd_timeout_s", 1.0);
+    // ⭐ IMU 数据陈旧阈值（2026-09-22）。0 = 关闭。见 inference_node.hpp 的说明。
+    this->declare_parameter<float>("imu_timeout_s", 0.05);
     // ⭐ PD 站立保底（2026-09-17）：启动模式。默认 pd_stand（安全优先）。
     //   "pd_stand" ⇒ 启动即 PD 站立（不跑策略），要跑策略需显式切（service/手柄）
     //   "policy"   ⇒ 旧行为（启动即跑策略）
@@ -106,8 +113,12 @@ void InferenceNode::load_config() {
     this->get_parameter("clip_cmd", clip_cmd_);
     this->get_parameter("joint_default_angle", joint_default_angle_);
     this->get_parameter("joint_limits", joint_limits_);
+    this->get_parameter("pd_stand_target", pd_stand_target_);
+    this->get_parameter("motor_temp_warn_c", temp_warn_c_);
+    this->get_parameter("motor_temp_cutoff_c", temp_cutoff_c_);
     this->get_parameter("gravity_z_upper", gravity_z_upper_);
     this->get_parameter("cmd_timeout_s", cmd_timeout_s_);
+    this->get_parameter("imu_timeout_s", imu_timeout_s_);
     {
         std::string sm = "pd_stand";
         this->get_parameter("start_mode", sm);
@@ -119,6 +130,61 @@ void InferenceNode::load_config() {
     this->get_parameter("gamma", latent_gamma);
     int latent_window_size = 1;
     this->get_parameter("window_size", latent_window_size);
+
+    // ⭐ 表尺寸校验（2026-09-22）：这几张表在热路径上都是【按下标裸读】的，
+    //   配错了不报错，只是行为悄悄变形：
+    //     joint_default_angle_ 短 ⇒ `act_[usd2urdf_[i]] = out*scale + joint_default_angle_[usd2urdf_[i]]`
+    //       越界读写 —— 而且是在电机已经使能、正在跑的时候
+    //     joint_limits_ 短 ⇒ obs_manager 只查前几个关节（静默少查几个）
+    //     joint_limits_ 长 ⇒ joint_pos_buffer_[i] 越界读
+    //   ⇒ 一律在【启动时】炸掉，别留到上电之后才发现。
+    if (joint_default_angle_.size() != static_cast<size_t>(joint_num_)) {
+        throw std::runtime_error(
+            "joint_default_angle must have exactly " + std::to_string(joint_num_) +
+            " values, but got " + std::to_string(joint_default_angle_.size()));
+    }
+    for (int i = 0; i < joint_num_; i++) {
+        if (!std::isfinite(joint_default_angle_[i])) {
+            throw std::runtime_error("joint_default_angle[" + std::to_string(i) +
+                                     "] is not finite");
+        }
+    }
+    if (!joint_limits_.empty()) {
+        if (joint_limits_.size() != 2 * static_cast<size_t>(joint_num_)) {
+            throw std::runtime_error(
+                "joint_limits must be empty or have exactly " +
+                std::to_string(2 * joint_num_) + " values (lo, hi per joint), but got " +
+                std::to_string(joint_limits_.size()));
+        }
+        for (int i = 0; i < joint_num_; i++) {
+            const double lo = joint_limits_[2 * i];
+            const double hi = joint_limits_[2 * i + 1];
+            if (!std::isfinite(lo) || !std::isfinite(hi) || lo >= hi) {
+                throw std::runtime_error(
+                    "joint_limits[" + std::to_string(i) + "] must satisfy lo < hi and be finite, got [" +
+                    std::to_string(lo) + ", " + std::to_string(hi) + "]");
+            }
+        }
+    }
+    if (pd_stand_target_.empty()) {
+        // 留空 = 沿用策略参考系（与原行为逐位一致）
+        pd_stand_target_ = joint_default_angle_;
+    } else if (pd_stand_target_.size() != static_cast<size_t>(joint_num_)) {
+        throw std::runtime_error(
+            "pd_stand_target must be empty or have exactly " + std::to_string(joint_num_) +
+            " values, but got " + std::to_string(pd_stand_target_.size()));
+    }
+    for (int i = 0; i < static_cast<int>(pd_stand_target_.size()); i++) {
+        if (!std::isfinite(pd_stand_target_[i])) {
+            throw std::runtime_error("pd_stand_target[" + std::to_string(i) +
+                                     "] is not finite");
+        }
+    }
+    if (temp_warn_c_ > 0.0f && temp_cutoff_c_ > 0.0f && temp_cutoff_c_ < temp_warn_c_) {
+        RCLCPP_WARN(this->get_logger(),
+                    "motor_temp_cutoff_c (%.0f) < motor_temp_warn_c (%.0f) "
+                    "⇒ 失能阈值会先触发，降级那一级形同虚设", temp_cutoff_c_, temp_warn_c_);
+    }
 
     policies_.clear();
     motion_policy_indices_.clear();
@@ -306,9 +372,16 @@ void InferenceNode::load_config() {
     print_vector<double>("clip_cmd", clip_cmd_);
     print_vector<double>("joint_default_angle", joint_default_angle_);
     print_vector<double>("joint_limits", joint_limits_);
+    print_vector<double>("pd_stand_target", pd_stand_target_);
+    RCLCPP_INFO(this->get_logger(), "motor_temp_warn_c: %.1f%s", temp_warn_c_,
+                temp_warn_c_ > 0.0f ? "" : "  (⚠️ 已关闭)");
+    RCLCPP_INFO(this->get_logger(), "motor_temp_cutoff_c: %.1f%s", temp_cutoff_c_,
+                temp_cutoff_c_ > 0.0f ? "" : "  (⚠️ 已关闭)");
     RCLCPP_INFO(this->get_logger(), "gravity_z_upper: %f", gravity_z_upper_);
     RCLCPP_INFO(this->get_logger(), "cmd_timeout_s: %f%s", cmd_timeout_s_,
                 cmd_timeout_s_ > 0.0f ? "" : "  (⚠️ 看门狗已关闭)");
+    RCLCPP_INFO(this->get_logger(), "imu_timeout_s: %f%s", imu_timeout_s_,
+                imu_timeout_s_ > 0.0f ? "" : "  (⚠️ IMU 陈旧检测已关闭)");
     RCLCPP_INFO(this->get_logger(), "start_mode: %s",
                 start_mode_policy_ ? "policy" : "pd_stand");
     RCLCPP_INFO(this->get_logger(), "act_mode (initial): %s",

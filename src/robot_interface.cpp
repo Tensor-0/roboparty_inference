@@ -4,6 +4,7 @@
 #include "robot_interface.hpp"
 
 #include <array>
+#include <cstdio>
 
 RobotInterface::RobotInterface(const std::string& config_file) {
     YAML::Node config = YAML::LoadFile(config_file);
@@ -367,14 +368,97 @@ void RobotInterface::clear_errors() {
     });
 }
 
+// ⭐ init 结果消费（2026-09-22）
+//
+//   原实现把 init_motor() 的返回值【丢掉】，然后无条件 is_init_ = true
+//   ⇒ 有一个电机没使能成功也算"初始化成功"，操作员毫无察觉地去站立。
+//
+//   两层判据，缺一不可：
+//
+//     ① 返回值。四个驱动（DM / XYN / LRO / EVO）语义一致：0 = 正常，非 0 = 故障码。
+//        ⚠️ 但 0 只说明【没报故障】，不说明"使能成功" —— DM 的 error_id_ 只在
+//           反馈帧高 4 位 > 7 时才写（dm_motor_driver.cpp:238），而 err = 1（使能）
+//           本来就 ≤ 7 ⇒ 它永远是初值 0，判不了"使能"这件事。
+//           （memory: dm-driver-error-id-bug，这个坑踩过）
+//
+//     ② 存活。refresh 之后 50 ms 内有没有回复 —— 用 response_count_ == 0 判。
+//        和运行时离线判定是同一个原语：每收到一帧就清零，且【先按电机 ID 过滤】
+//        （dm_motor_driver.cpp:224-229），别的电机的回复不算数。
+//        ⚠️ 这里用 > 0 而不是 > offline_threshold_（25）：init 只发了 1 帧，
+//           拿 25 当阈值等于没检查。
+//        ⚠️ CANFD 的一条 MIT 帧由总线上的 0 号电机代发，所以运行时那个
+//           offline_threshold_ 判定对同总线其它电机是失效的；但 refresh 是
+//           【每台电机各发一帧】的，所以这里的探针对 CAN 和 CANFD 都成立。
+//
+//   任一电机没过 ⇒ 全体失能（fail-closed）并把 is_init_ 留在 false。
+//   为什么整体拒绝而不是只警告：9/10 个电机使能的机器人站不住，而操作员
+//   未必看得出来；失能的那个可能正是承重腿。宁可上不了电，不要站到一半垮掉。
 void RobotInterface::init_motors() {
     std::unique_lock<std::mutex> command_lock(command_mutex_);
     if (is_init_.load()) {
         throw std::runtime_error("Motors are already initialized");
     }
-    exec_motors_parallel([](std::shared_ptr<MotorDriver>& motor, int) {
-        motor->init_motor();
+
+    const auto describe_motor = [this](size_t idx) {
+        const int joint_idx = (idx < motor2urdf_.size()) ? motor2urdf_[idx] : -1;
+        return motors_[idx]->get_can_name() + "/id=" +
+               std::to_string(motors_cfg_->motor_id_[idx]) + " (joint " +
+               std::to_string(joint_idx) + ")";
+    };
+
+    std::vector<std::string> failures;
+    std::mutex failures_mutex;
+    exec_motors_parallel([&](std::shared_ptr<MotorDriver>& motor, int idx) {
+        std::string failure;
+        try {
+            const uint8_t code = motor->init_motor();
+            if (code != 0) {
+                char code_text[8];
+                std::snprintf(code_text, sizeof(code_text), "0x%02X", code);
+                failure = std::string("init_motor() returned ") + code_text + " (fault)";
+            }
+        } catch (const std::exception& e) {
+            // 让每台电机都把话说完：一条总线上有电机抛异常，不该挡住别的电机
+            // 报出自己的问题，也不该让我们在半初始化状态下直接往上层抛。
+            failure = std::string("init_motor() threw: ") + e.what();
+        }
+        if (!failure.empty()) {
+            std::lock_guard<std::mutex> lock(failures_mutex);
+            failures.push_back(describe_motor(static_cast<size_t>(idx)) + ": " + failure);
+        }
     });
+
+    if (failures.empty()) {
+        exec_motors_parallel([](std::shared_ptr<MotorDriver>& motor, int) {
+            motor->refresh_motor_status();
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        exec_motors_parallel([&](std::shared_ptr<MotorDriver>& motor, int idx) {
+            if (motor->get_response_count() > 0) {
+                std::lock_guard<std::mutex> lock(failures_mutex);
+                failures.push_back(describe_motor(static_cast<size_t>(idx)) +
+                                   ": no reply within 50 ms after refresh");
+            }
+        });
+    }
+
+    if (!failures.empty()) {
+        std::sort(failures.begin(), failures.end());
+        std::string message = "init_motors failed (" + std::to_string(failures.size()) +
+                              "/" + std::to_string(motors_.size()) + "): ";
+        for (size_t i = 0; i < failures.size(); ++i) {
+            if (i > 0) {
+                message += "; ";
+            }
+            message += failures[i];
+        }
+        message += " -- all motors deinitialized, is_init_ stays false";
+        exec_motors_parallel([](std::shared_ptr<MotorDriver>& motor, int) {
+            motor->deinit_motor();
+        });
+        throw std::runtime_error(message);
+    }
+
     is_init_.store(true);
 }
 
@@ -452,6 +536,51 @@ std::string RobotInterface::offline_motor_list() const {
                           "(count=" + std::to_string(response_count) + ")";
     }
     return offline_motors;
+}
+
+// ⭐ 温度监控（2026-09-22）：见头文件里的说明。只读 atomic，不加锁。
+float RobotInterface::max_motor_temperature() const {
+    float hottest = 0.0f;
+    for (const auto& motor : motors_) {
+        const float temperature = motor->get_motor_temperature();
+        if (temperature > hottest) {
+            hottest = temperature;
+        }
+    }
+    return hottest;
+}
+
+std::string RobotInterface::hot_motor_list(float limit) const {
+    std::string hot_motors;
+    for (size_t idx = 0; idx < motors_.size(); ++idx) {
+        const float temperature = motors_[idx]->get_motor_temperature();
+        if (temperature <= limit) {
+            continue;
+        }
+        if (!hot_motors.empty()) {
+            hot_motors += ", ";
+        }
+        hot_motors += motors_[idx]->get_can_name() + "/id=" +
+                      std::to_string(motors_cfg_->motor_id_[idx]) + "(" +
+                      std::to_string(static_cast<long>(std::lround(temperature))) + "C)";
+    }
+    return hot_motors.empty() ? "none" : hot_motors;
+}
+
+// ⭐ IMU 数据新鲜度（2026-09-22）：见 imu_driver.hpp 里的实测记录。
+//   ⚠️ 这里必须用 steady_clock，不能和驱动那边的时钟混用别的源。
+float RobotInterface::imu_data_age_s() const {
+    if (!imu_) {
+        return -1.0f;
+    }
+    const int64_t last_ns = imu_->last_frame_ns();
+    if (last_ns == 0) {
+        return -1.0f;  // 一帧都没收到过 —— 不是"陈旧"，交给 NaN 守卫
+    }
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    return static_cast<float>(static_cast<double>(now_ns - last_ns) * 1e-9);
 }
 
 void RobotInterface::throw_if_motors_offline() const {

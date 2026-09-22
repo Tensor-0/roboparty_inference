@@ -181,9 +181,13 @@ void InferenceNode::reset_runtime_state() {
     }
     {
         std::unique_lock<std::mutex> lock(act_mutex_);
-        for (int i = 0; i < joint_num_; i++) {
-            act_[i] = static_cast<float>(joint_default_angle_[i]);
-            last_act_[i] = static_cast<float>(joint_default_angle_[i]);
+        // ⭐ PD 站立目标（2026-09-22）：复位时停在【保底姿态】而不是策略参考系。
+        //   启动模式默认就是 pd_stand，所以这才是"上电后第一帧要摆成什么样"。
+        //   （pd_stand_target_ 留空时 load_config 已把它填成 joint_default_angle_，
+        //    所以这条改动对没配该项的机器人逐位等价。）
+        for (int i = 0; i < joint_num_ && i < static_cast<int>(pd_stand_target_.size()); i++) {
+            act_[i] = static_cast<float>(pd_stand_target_[i]);
+            last_act_[i] = static_cast<float>(pd_stand_target_[i]);
         }
     }
     if (supports_interrupt()) {
@@ -277,6 +281,11 @@ void InferenceNode::reset_policy_runtime(PolicyRuntime& policy) {
 
 void InferenceNode::apply_action() {
     std::unique_lock<std::mutex> control_lock(control_mutex_);
+    // ⭐ 温度轮询（2026-09-22）：放在所有分支【之前】。
+    //   ① 它跟"策略跑不跑"无关 —— 电机只要使能着就值得看温度
+    //      （操作员按 B 暂停之后，PD 保底照样在发热）；
+    //   ② 过热要做的两件事（切 PD / 失能）必须赶在本周期下发之前生效。
+    check_motor_temperature();
     // ⭐ PD 站立保底（2026-09-17）：PD 模式【绕过 is_running_】。
     //
     //   为什么：is_running_ 的语义是"策略要不要跑"（操作员按 B 暂停时会置 false）。
@@ -289,10 +298,73 @@ void InferenceNode::apply_action() {
     if (!pd_mode && !is_running_.load()) {
         return;
     }
+    bool bad_action = false;
+    bool clipped_action = false;
     {
         std::unique_lock<std::mutex> lock(act_mutex_);
+        // ⭐ PD 目标由【本线程】写（2026-09-22）。
+        //   原来是推理线程在 PD 模式下写 act_ = joint_default_angle_，
+        //   而 control 线程只负责平滑 ⇒ PD 保底依赖"推理线程还活着"。
+        //   恰恰在最需要它的时候不成立：
+        //     ① 按 B 暂停后跌倒：推理线程过不了 is_running_ 那道门，
+        //        永远走不到 PD 分支 ⇒ act_ 停在最后一个策略动作上；
+        //     ② 推理 overrun / 卡在 ONNX Run 里：同上。
+        //   本线程本来就 250 Hz 在跑，写 act_ 是顺手的事，且不依赖任何人。
+        //   ⚠️ 因此推理线程的 PD 分支【不能再写 act_】（两个线程频率不同会互相覆盖）。
+        if (pd_mode) {
+            for (size_t i = 0; i < act_.size() && i < pd_stand_target_.size(); ++i) {
+                act_[i] = static_cast<float>(pd_stand_target_[i]);
+            }
+        }
+        // ⭐ 非有限目标（2026-09-22）：策略发散时输出会变 NaN，而 NaN 是【粘住】的
+        //   —— clip_actions 对 NaN 是空操作，NaN 经观测 last_action 又喂回网络，
+        //   之后每一帧都是 NaN。所以不能只记一笔日志，必须当场切 PD。
+        //   处理顺序很关键：必须在平滑之前替换，否则 NaN 会先把 last_act_ 污染掉
+        //   （last_act_ = α·NaN + (1−α)·last_act_ = NaN），那份状态恢复不回来。
+        for (size_t i = 0; i < act_.size(); ++i) {
+            if (!std::isfinite(act_[i])) {
+                bad_action = true;
+                act_[i] = last_act_[i];  // 保持上一帧目标：这一周期不动这个关节
+            }
+        }
         for (size_t i = 0; i < act_.size(); i++) {
             last_act_[i] = act_alpha_ * act_[i] + (1 - act_alpha_) * last_act_[i];
+        }
+        // ⭐ 下发目标裁剪（2026-09-22）：见 utils/safety_clip.hpp 的说明。
+        //   裁在【关节坐标系】、robot_->apply_action() 之前 —— 踝关节 decouple
+        //   在那边内部做，它收到的是关节角。
+        //   尺寸不符时【不裁】而不是瞎裁：load_config 已经按 2×joint_num 校验过，
+        //   走到这里说明配置为空（= 原本就不裁）。
+        if (joint_limits_.size() == 2 * last_act_.size()) {
+            for (size_t j = 0; j < last_act_.size(); ++j) {
+                double target = last_act_[j];
+                if (safety::clip_joint_target(target, joint_limits_[2 * j],
+                                              joint_limits_[2 * j + 1],
+                                              safety::kJointLimitMargin)) {
+                    clipped_action = true;
+                    last_act_[j] = static_cast<float>(target);
+                }
+            }
+        }
+    }
+    // 日志都放在锁外（构造字符串不该占着 act_mutex_）
+    if (bad_action) {
+        const bool was_policy = (act_mode_.load() == ActMode::POLICY);
+        switch_to_pd_stand("non-finite action from the policy");
+        if (was_policy) {
+            RCLCPP_ERROR(this->get_logger(),
+                         "策略输出了非有限的目标（NaN/inf）⇒ 切 PD 站立。"
+                         "NaN 会经 last_action 观测自锁，不会自己恢复");
+        }
+    }
+    if (clipped_action) {
+        const int64_t now_ns = steady_ns();
+        if (now_ns - last_clip_log_ns_ > 2000000000LL) {  // 每 2 s 最多一行
+            last_clip_log_ns_ = now_ns;
+            RCLCPP_WARN(this->get_logger(),
+                        "下发目标被关节限位裁剪（内侧留 %.2f rad）。"
+                        "偶发 = 保护生效；常态 = 策略发散或 joint_limits 配错",
+                        safety::kJointLimitMargin);
         }
     }
     // ⭐ 前馈力矩（2026-09-21）：按 q_des 查表插值，连同位置一起下发。
@@ -323,6 +395,58 @@ void InferenceNode::apply_action() {
             RCLCPP_WARN(this->get_logger(), "Offline motors: %s",
                         robot_->offline_motor_list().c_str());
         }
+    }
+}
+
+// ⭐ 温度轮询（2026-09-22）
+//   为什么在 control 线程：它是唯一一直在跑的那个（250 Hz），而且过热要做的
+//   两件事（切 PD / 失能）都必须赶在下发【之前】生效 —— 放在推理线程会晚一整个周期，
+//   且推理线程本身可能就是卡住的那个。
+//   开销：10 次 atomic 读，可忽略；但动作仍要连续 kTempConsecutiveCycles 个周期
+//   才生效，用来滤掉单帧垃圾（温度 100 ms 内不可能真变）。
+void InferenceNode::check_motor_temperature() {
+    if (!robot_->is_init_.load()) {
+        return;
+    }
+    if (temp_warn_c_ <= 0.0f && temp_cutoff_c_ <= 0.0f) {
+        return;
+    }
+    const float hottest = robot_->max_motor_temperature();
+    temp_warn_cycles_ = (temp_warn_c_ > 0.0f && hottest > temp_warn_c_)
+                            ? temp_warn_cycles_ + 1 : 0;
+    temp_cutoff_cycles_ = (temp_cutoff_c_ > 0.0f && hottest > temp_cutoff_c_)
+                              ? temp_cutoff_cycles_ + 1 : 0;
+
+    if (temp_warn_cycles_ == kTempConsecutiveCycles) {
+        const bool was_policy = (act_mode_.load() == ActMode::POLICY);
+        if (was_policy) {
+            RCLCPP_ERROR(this->get_logger(),
+                         "电机温度 %.0f ℃ > %.0f ℃ ⇒ 停止策略、切 PD 站立。过热: %s",
+                         hottest, temp_warn_c_, robot_->hot_motor_list(temp_warn_c_).c_str());
+        }
+        switch_to_pd_stand("motor over-temperature");
+    }
+    if (temp_cutoff_cycles_ >= kTempConsecutiveCycles && !temp_cutoff_fired_) {
+        temp_cutoff_fired_ = true;
+        RCLCPP_FATAL(this->get_logger(),
+                     "电机温度 %.0f ℃ > %.0f ℃ ⇒ 失能（机器人会失去支撑）。过热: %s",
+                     hottest, temp_cutoff_c_, robot_->hot_motor_list(temp_cutoff_c_).c_str());
+        try {
+            robot_->deinit_motors();
+        } catch (const std::exception& e) {
+            // 并发失能（操作员正好按了 X）会让 deinit 抛"已经失能" —— 那不是故障。
+            // ⚠️ 但异常绝不能漏出去：control() 的外层 catch 会 rclcpp::shutdown()，
+            //    过热把一个还活着的节点整个关掉，比过热本身更糟。
+            RCLCPP_WARN(this->get_logger(), "过热失能时电机已处于失能状态: %s", e.what());
+        }
+    }
+    // 每 10 s 一行最大值 —— 这行是用来【验证读数本身】的：
+    // 上板第一眼就该看到像样的 25~45 ℃，而不是等它误触发才发现 byte7 不是温度。
+    const int64_t now_ns = steady_ns();
+    if (now_ns - last_temp_log_ns_ > 10000000000LL) {
+        last_temp_log_ns_ = now_ns;
+        RCLCPP_INFO(this->get_logger(), "电机温度最高 %.0f ℃（%s）",
+                    hottest, robot_->hot_motor_list(hottest - 0.5f).c_str());
     }
 }
 
@@ -365,6 +489,25 @@ void InferenceNode::control() {
                     }
                 } catch (const std::exception& e) {
                     switch_to_pd_stand("IMU read failed in safety check");
+                }
+
+                // ⭐ IMU 数据陈旧降级（2026-09-22）
+                //   上面那个 NULL 检查管的是"四元数解出非有限值"，管不了这一种：
+                //   串口断了以后驱动【不再更新缓存】，get_quat() 一直返回最后一帧的值
+                //   —— 有穷、不抛异常、看着完全正常。2026-09-22 台架实测：
+                //   拔线后四元数 176 秒一字不差，驱动零报错，策略会拿不动的姿态继续走。
+                //   ⇒ 只能靠"驱动最后一次收到帧是什么时候"来判，见 imu_driver.hpp。
+                //   ⚠️ age < 0 = 一帧都没收到过，那条路归 NaN 守卫管，这里不重复报。
+                const float imu_age_s = robot_->imu_data_age_s();
+                if (imu_timeout_s_ > 0.0f && imu_age_s > imu_timeout_s_) {
+                    if (!imu_stale_fired_) {
+                        imu_stale_fired_ = true;
+                        RCLCPP_ERROR(this->get_logger(),
+                                     "IMU 已 %.0f ms 没有新数据（阈值 %.0f ms）⇒ 切 PD 站立。"
+                                     "注意姿态是【冻住】的不是 NaN，上面的 NaN 守卫不会响",
+                                     imu_age_s * 1000.0f, imu_timeout_s_ * 1000.0f);
+                    }
+                    switch_to_pd_stand("IMU data stale");
                 }
 
                 // ⭐ 指令看门狗（2026-09-22）：手柄 / `/cmd_vel` 断线 ⇒ 切 PD 站立。
@@ -425,6 +568,7 @@ void InferenceNode::inference() {
     }
     const auto period = std::chrono::microseconds(static_cast<long long>(dt_ * 1000 * 1000 * decimation_));
     auto next_release = std::chrono::steady_clock::now();
+    int overrun_streak = 0;  // ⭐ 连续 overrun 计数（2026-09-22），只在 inference 线程里
 
     while(rclcpp::ok()){
         next_release += period;
@@ -457,16 +601,13 @@ void InferenceNode::inference() {
                 std::this_thread::sleep_until(next_release);
                 continue;
             }
-            // ⭐ PD 站立保底（2026-09-17）：PD 模式下【不跑网络】，
-            //    act_ 直接置为 joint_default_angle_（PD 站立目标）。
-            //    ⚠️ 动作下发仍由 control 线程的 act_alpha 平滑完成（防跳变）。
+            // ⭐ PD 站立保底（2026-09-17）：PD 模式下【不跑网络】。
+            //    ⚠️ 2026-09-22 改：act_ 不再由这里写 —— 改由 control 线程在
+            //       apply_action() 里写（它 250 Hz 一直在跑，不依赖推理线程活着）。
+            //       两处都写会在 pd_stand_target_ ≠ joint_default_angle_ 时互相覆盖：
+            //       两个线程频率不同 ⇒ 目标在两个值之间来回跳。
+            //       这里只负责把 act_ 发到 /action 话题上（观测用）。
             if (act_mode_.load() == ActMode::PD_STAND) {
-                {
-                    std::unique_lock<std::mutex> lock(act_mutex_);
-                    for (size_t i = 0; i < act_.size(); ++i) {
-                        act_[i] = static_cast<float>(joint_default_angle_[i]);
-                    }
-                }
                 publish_action();
                 mode_lock.unlock();
                 const auto now = std::chrono::steady_clock::now();
@@ -547,12 +688,27 @@ void InferenceNode::inference() {
         auto loop_end = std::chrono::steady_clock::now();
         auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(loop_end - loop_start);
         if (loop_end > next_release) {
+            // ⭐ 推理超时降级（2026-09-22）：原来只打一行 WARN 就接着跑。
+            //   一次超时不必当真（调度抖动），但连续 kOverrunStreakToPd 次
+            //   （5 × 20 ms ≈ 100 ms）就说明这台机器已经跟不上控制周期了 ——
+            //   此时算出来的动作是"过期"的，继续下发比切 PD 危险。
+            //   切过去之后 PD 分支不跑网络，本身也把负载降了。
+            //   ⚠️ 判据用 == 不用 >=：只在跨过阈值那一刻报一次，不刷屏。
+            if (++overrun_streak == kOverrunStreakToPd) {
+                RCLCPP_ERROR(this->get_logger(),
+                             "推理连续 %d 次 overrun（本次 %lld us / 周期 %lld us）⇒ 切 PD 站立",
+                             overrun_streak, static_cast<long long>(elapsed_time.count()),
+                             static_cast<long long>(period.count()));
+                switch_to_pd_stand("inference overrun");
+            }
             RCLCPP_WARN(this->get_logger(), "Inference loop overran! Took %lld us, but period is %lld us.", static_cast<long long>(elapsed_time.count()), static_cast<long long>(period.count()));
             const auto missed_periods = (loop_end - next_release) / period;
             next_release += period * missed_periods;
             if (next_release < loop_end) {
                 next_release += period;
             }
+        } else {
+            overrun_streak = 0;
         }
         std::this_thread::sleep_until(next_release);
     }
