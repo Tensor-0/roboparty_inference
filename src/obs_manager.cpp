@@ -228,7 +228,9 @@ void InferenceNode::get_cmd_vel_obs(std::vector<float>& segment) {
 }
 
 void InferenceNode::get_dof_pos_obs(std::vector<float>& segment) {
-    joint_pos_buffer_ = robot_->get_joint_q();
+    // ⚠️ A3：不再自己读缓存 —— 用本拍 snapshot_joint_state() 的快照，
+    //    这样 obs 与 /joint_states 逐位一致（否则差一个控制周期）。
+
     for (int i = 0; i < joint_num_; i++) {
         segment[i] = (joint_pos_buffer_[usd2urdf_[i]] - joint_default_angle_[usd2urdf_[i]]) * obs_scales_dof_pos_;
     }
@@ -247,7 +249,7 @@ void InferenceNode::get_dof_pos_obs(std::vector<float>& segment) {
 }
 
 void InferenceNode::get_dof_vel_obs(std::vector<float>& segment) {
-    joint_vel_buffer_ = robot_->get_joint_vel();
+
     for (int i = 0; i < joint_num_; i++) {
         segment[i] = joint_vel_buffer_[usd2urdf_[i]] * obs_scales_dof_vel_;
     }

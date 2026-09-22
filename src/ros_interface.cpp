@@ -740,6 +740,7 @@ void InferenceNode::read_joints_srv(const std::shared_ptr<std_srvs::srv::Trigger
                                      std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
     try {
         robot_->read_joints();
+        snapshot_joint_state();      // 服务路径要显式快照（不在推理循环里）
         response->success = true;
         response->message = "Joints read successfully";
         publish_joint_states();
@@ -874,10 +875,15 @@ void InferenceNode::stop_inference_srv(const std::shared_ptr<std_srvs::srv::Trig
     response->message = "Inference stopped";
 }
 
-void InferenceNode::publish_joint_states() {
+void InferenceNode::snapshot_joint_state() {
     joint_pos_buffer_ = robot_->get_joint_q();
     joint_vel_buffer_ = robot_->get_joint_vel();
     joint_torques_buffer_ = robot_->get_joint_tau();
+}
+
+void InferenceNode::publish_joint_states() {
+    // ⚠️ 不再自己重读缓存 —— 发的是【本拍开头 snapshot 的那一份】，
+    //    与 obs 用的是同一份（见头文件里 A3 的说明）。
     joint_state_msg_.header.stamp = this->now();
     joint_state_msg_.effort.resize(joint_num_);
     for (int i = 0; i < joint_num_; i++) {
@@ -905,6 +911,12 @@ void InferenceNode::publish_action() {
         }
     }
     action_publisher_->publish(action_msg_);
+}
+
+void InferenceNode::publish_obs() {
+    const auto& policy = active_policy();
+    obs_msg_.data.assign(policy.ctx->input_buffer.begin(), policy.ctx->input_buffer.end());
+    obs_publisher_->publish(obs_msg_);
 }
 
 void InferenceNode::publish_imu() {

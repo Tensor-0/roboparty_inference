@@ -1030,6 +1030,7 @@ void InferenceNode::inference() {
                     std::chrono::microseconds(static_cast<long long>(stall_ms * 1000.0f)));
             }
             robot_->read_imu();
+            snapshot_joint_state();   // ⭐ A3：一拍一次，obs 与 /joint_states 共用
             update_obs_segments(policy.obs_segments, policy.obs_layout);
             publish_imu();
             publish_joint_states();
@@ -1060,6 +1061,9 @@ void InferenceNode::inference() {
                 step_motion_frame();
             }
             policy.is_first_frame = false;
+
+            // ⭐ A3：喂模型之前先把它发出去（离线回放要拿它逐位对）
+            publish_obs();
 
             policy.ctx->session->Run(Ort::RunOptions{nullptr},
                 policy.ctx->input_names_raw.data(), policy.ctx->input_tensor.get(), policy.ctx->num_inputs,

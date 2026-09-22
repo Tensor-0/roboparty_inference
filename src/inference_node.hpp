@@ -175,6 +175,9 @@ class InferenceNode : public rclcpp::Node {
         publish_node_metadata();
         imu_publisher_ =
             this->create_publisher<sensor_msgs::msg::Imu>("/imu", data_qos);
+        // ⭐ A3：模型输入（39 维 @50Hz ≈ 8 kB/s；没人订阅时 best_effort 直接丢，不占带宽）
+        obs_publisher_ =
+            this->create_publisher<std_msgs::msg::Float32MultiArray>("/policy_obs", data_qos);
         joint_state_publisher_ =
             this->create_publisher<sensor_msgs::msg::JointState>("/joint_states", data_qos);
         inference_thread_ = std::thread(&InferenceNode::inference, this);
@@ -270,6 +273,7 @@ class InferenceNode : public rclcpp::Node {
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr action_publisher_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr act_mode_publisher_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr node_metadata_publisher_;
+    rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr obs_publisher_;
     std::string policy_config_path_;   // ⭐ A3：policy yaml 的路径（launch 传进来，供哈希用）
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_publisher_;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_publisher_;
@@ -392,6 +396,7 @@ class InferenceNode : public rclcpp::Node {
     std::vector<float> act_, last_act_, cmd_vel_, interrupt_action_, perception_obs_buffer_;
     std::vector<float> joint_pos_buffer_, joint_vel_buffer_, joint_torques_buffer_, quat_buffer_, ang_vel_buffer_;
     sensor_msgs::msg::JointState joint_state_msg_, action_msg_;
+    std_msgs::msg::Float32MultiArray obs_msg_;   // ⭐ A3：给 onnx 的那份输入
 
     void subs_joy_callback(const std::shared_ptr<sensor_msgs::msg::Joy> msg);
     void subs_cmd_callback(const std::shared_ptr<geometry_msgs::msg::Twist> msg);
@@ -473,9 +478,23 @@ class InferenceNode : public rclcpp::Node {
                               std::shared_ptr<std_srvs::srv::Trigger::Response> response);
     void stop_inference_srv(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
                             std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+    // ⭐ A3（2026-09-23）：一拍只读一次关节状态。
+    //   原来 obs 算一次（getter 里读）、发 /joint_states 又读一次，
+    //   中间隔着一次 DDS 发布；而 control 线程每 4 ms 刷新缓存
+    //   ⇒ 约 28% 的拍，bag 里的 /joint_states 是【下一拍】的快照。
+    //   验收脚本就是这么抓出来的（dof_pos/dof_vel 28% 帧差一个控制周期）。
+    //   现在：每拍开头读一次进缓冲，obs 与 /joint_states 都用这一份。
+    void snapshot_joint_state();
     void publish_joint_states();
     void publish_action();
     void publish_imu();
+    // ⭐ A3（2026-09-23）：把【喂给 onnx 的那份输入】发出来。
+    //   为什么必须发：A3 的验收是"离线重建的 obs 与真机逐帧一致（<1e-6）"，
+    //   而 obs 原本哪儿都没落盘 ⇒ 只能隔着 /action 比，而 /action 又隔着
+    //   act_alpha 平滑和 250/50 Hz 采样差，永远比不到 1e-6。
+    //   发 input_buffer 而不是 policy.obs：前者是过完 obs 裁剪、过完 frame_stack
+    //   堆叠之后真正送进模型的那份，可以逐位比。
+    void publish_obs();
     
     template <typename T>
     void print_vector(const std::string& name, const std::vector<T>& vec) {
