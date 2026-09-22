@@ -28,7 +28,8 @@
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <sensor_msgs/msg/joy.hpp>
 #include <geometry_msgs/msg/twist.hpp>
-#include <std_msgs/msg/float32_multi_array.hpp> 
+#include <std_msgs/msg/float32_multi_array.hpp>
+#include <std_msgs/msg/string.hpp>          // ⭐ A2 事件话题（/act_mode）
 #include "utils/motion_loader.hpp"
 #include "utils/latent_loader.hpp"
 #include "utils/safety_clip.hpp"
@@ -161,6 +162,12 @@ class InferenceNode : public rclcpp::Node {
             std::bind(&InferenceNode::subs_joint_state_callback, this, std::placeholders::_1));
         action_publisher_ =
             this->create_publisher<sensor_msgs::msg::JointState>("/action", data_qos);
+        // ⭐ A2（2026-09-22）：模式事件。transient_local ⇒ 录包的人中途接上也能
+        //   立刻拿到"现在是什么模式"，不用从零开始等下一次切换。
+        auto event_qos = rclcpp::QoS(rclcpp::KeepLast(10)).transient_local().reliable();
+        act_mode_publisher_ =
+            this->create_publisher<std_msgs::msg::String>("/act_mode", event_qos);
+        publish_act_mode("", start_mode_policy_ ? "POLICY" : "PD_STAND", "startup", "");
         imu_publisher_ =
             this->create_publisher<sensor_msgs::msg::Imu>("/imu", data_qos);
         joint_state_publisher_ =
@@ -220,7 +227,14 @@ class InferenceNode : public rclcpp::Node {
     //   ⚠️ 跌倒/关节超限【自动切到 PD_STAND，且不自动切回】——
     //      自动切回会在阈值附近反复横跳，而每次切换都有动作跳变。
     enum class ActMode { PD_STAND, POLICY };
-    void switch_to_pd_stand(const char* reason);
+    // ⭐ 事件话题（2026-09-22，A2）：模式切换要能被录下来 —— A3 的 bag 里如果没有
+    //   这一串，事后分不清"这段动作是策略跑的"还是"PD 兜底在撑"。
+    //   用 std_msgs/String 装一行 JSON（不加自定义 msg：省掉 msg/ + CMake 改动，
+    //   而消费方是 Python 工具链，json.loads 最省事）。
+    //   QoS 用 transient_local ⇒ 录包的人中途接上也能立刻拿到当前模式。
+    void publish_act_mode(const char* prev_mode, const char* new_mode,
+                          const std::string& reason, const std::string& detail);
+    void switch_to_pd_stand(const char* reason, const std::string& detail = "");
     void switch_to_policy();
     ActMode act_mode() const { return act_mode_.load(); }
    private:
@@ -243,6 +257,7 @@ class InferenceNode : public rclcpp::Node {
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr perception_subscription_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_subscription_;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr action_publisher_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr act_mode_publisher_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_publisher_;
     rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_publisher_;
     rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr clear_depth_history_client_;

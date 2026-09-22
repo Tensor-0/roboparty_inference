@@ -891,8 +891,16 @@ void InferenceNode::publish_action() {
     action_msg_.header.stamp = this->now();
     {
         std::unique_lock<std::mutex> lock(act_mutex_);
+        // ⭐ A2（2026-09-22）：发 last_act_，不是 act_。
+        //   act_ 是"这一周期想要的目标"，还是【裁剪前】的；
+        //   last_act_ 才是真正下发给电机那一份（过完 act_alpha 平滑 + 限位裁剪）。
+        //   发 act_ 的话，bag 里会出现一个【从来没被下发过】的值 —— 事后拿它
+        //   和电机实际目标对，对不上，而且看不出来是裁剪还是平滑造成的。
+        //   ⚠️ 采样率仍是推理线程的 50 Hz（电机是 250 Hz）：这里记录的是
+        //      "每 4 帧里的一帧"，做逐位比对时要知道这点；要全量得挪到 control 线程，
+        //      但那会把一次 DDS 发布塞进实时线程，暂不做。
         for (int i = 0; i < joint_num_; i++) {
-            action_msg_.position[i] = act_[i];
+            action_msg_.position[i] = last_act_[i];
         }
     }
     action_publisher_->publish(action_msg_);

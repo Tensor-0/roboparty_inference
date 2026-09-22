@@ -141,15 +141,56 @@ void InferenceNode::setup_model(std::unique_ptr<ModelContext>& ctx, std::string 
 }
 
 // ⭐ PD 站立保底（2026-09-17）
-//   switch_to_pd_stand：把 act_ 的目标改成 joint_default_angle_（PD 站立）。
+//   switch_to_pd_stand：切到 PD 站立（目标由 control 线程按 pd_stand_target_ 写）。
 //     ⚠️ 不直接改 last_act_ —— 让 control 线程里的 act_alpha 平滑把它带过去（防跳变）。
 //   switch_to_policy：切回策略。
 //   ⚠️ 切到 PD 后【不自动切回】（跌倒是"出事"，自动切回会在阈值附近反复横跳）。
-void InferenceNode::switch_to_pd_stand(const char* reason) {
+//
+// ⭐ A2（2026-09-22）：这两处是【唯一】的模式变更点，所以事件话题也挂在这里 ——
+//   每次真变更发一条 /act_mode（JSON）。detail 用来带上下文（哪个电机离线、
+//   漏了多少 ms），否则事后只有一句"切 PD 了"，等于没有信息。
+//   ⚠️ 这里可能在 control 线程（实时）里被调用：拼 JSON 会分配内存，所以
+//      只在【真的变了】那一刻做（上面的 exchange 保证），不是每个周期。
+static std::string json_escape(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (const char c : text) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if (c == '\n') {
+            out += "\\n";
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+void InferenceNode::publish_act_mode(const char* prev_mode, const char* new_mode,
+                                     const std::string& reason, const std::string& detail) {
+    if (!act_mode_publisher_) {
+        return;  // 构造过程中就会调用（初始化那一刻还没建发布者）
+    }
+    std::string payload = std::string("{\"stamp_ns\":") + std::to_string(this->now().nanoseconds()) +
+                          ",\"prev\":\"" + json_escape(prev_mode) +
+                          "\",\"mode\":\"" + json_escape(new_mode) +
+                          "\",\"reason\":\"" + json_escape(reason) + "\"";
+    if (!detail.empty()) {
+        payload += ",\"detail\":\"" + json_escape(detail) + "\"";
+    }
+    payload += "}";
+    std_msgs::msg::String msg;
+    msg.data = payload;
+    act_mode_publisher_->publish(msg);
+}
+
+void InferenceNode::switch_to_pd_stand(const char* reason, const std::string& detail) {
     ActMode prev = act_mode_.exchange(ActMode::PD_STAND);
     if (prev != ActMode::PD_STAND) {
         RCLCPP_WARN(this->get_logger(),
                     "act_mode: POLICY -> PD_STAND  (%s)", reason ? reason : "");
+        publish_act_mode("POLICY", "PD_STAND", reason ? reason : "", detail);
     }
 }
 
@@ -157,6 +198,7 @@ void InferenceNode::switch_to_policy() {
     ActMode prev = act_mode_.exchange(ActMode::POLICY);
     if (prev != ActMode::POLICY) {
         RCLCPP_INFO(this->get_logger(), "act_mode: PD_STAND -> POLICY");
+        publish_act_mode("PD_STAND", "POLICY", "manual switch", "");
         // 切回策略时让推理从干净状态开始（清 last_act_ 会让它突然弹回，
         // 所以只重置策略内部状态，动作仍由 act_alpha 平滑过渡）
         std::unique_lock<std::mutex> lock(act_mutex_);
@@ -426,11 +468,13 @@ void InferenceNode::apply_action() {
     //      已经在 PD_STAND 时是静默 no-op。字符串也只在真切换那一刻才拼。
     //   ⚠️ 不自动切回：与跌倒检测一致 —— 反复横跳每次都有动作跳变。
     if (robot_->is_init_.load() && robot_->motors_offline()) {
-        const bool switching = (act_mode_.load() == ActMode::POLICY);
-        switch_to_pd_stand("motor offline");
-        if (switching) {
-            RCLCPP_WARN(this->get_logger(), "Offline motors: %s",
-                        robot_->offline_motor_list().c_str());
+        if (act_mode_.load() == ActMode::POLICY) {
+            // ⭐ A2：离线名单进事件（事后看 bag 才知道是哪几台、几次没回）
+            const std::string offline = robot_->offline_motor_list();
+            switch_to_pd_stand("motor offline", offline);
+            RCLCPP_WARN(this->get_logger(), "Offline motors: %s", offline.c_str());
+        } else {
+            switch_to_pd_stand("motor offline");
         }
     }
 }
@@ -530,6 +574,54 @@ rcl_interfaces::msg::SetParametersResult InferenceNode::on_parameter_change(
             inject_stall_ms_.store(static_cast<float>(stall_ms));
             RCLCPP_ERROR(this->get_logger(),
                          "⚠️ 安全注入：推理循环每周期多睡 %.0f ms（造 overrun）", stall_ms);
+        } else if (name == "pd_stand_target") {
+            // ⭐ A2 期间补（2026-09-22）：这几个参数是【每周期都会读】的成员，
+            //   所以运行时改是能生效的 —— 那就必须真的写回成员，否则就是
+            //   "ros2 param set 返回成功、实际什么都没变"（本仓库最反对的那种失败）。
+            const auto values = param.as_double_array();
+            if (values.size() != static_cast<std::size_t>(joint_num_)) {
+                result.successful = false;
+                result.reason = "pd_stand_target must have exactly " + std::to_string(joint_num_) +
+                                " values, got " + std::to_string(values.size());
+                return result;
+            }
+            for (const double value : values) {
+                if (!std::isfinite(value)) {
+                    result.successful = false;
+                    result.reason = "pd_stand_target must be finite";
+                    return result;
+                }
+            }
+            {
+                std::unique_lock<std::mutex> lock(act_mutex_);
+                pd_stand_target_ = values;
+            }
+            RCLCPP_ERROR(this->get_logger(), "⚠️ pd_stand_target 已在运行时更新（%zu 个值）",
+                         values.size());
+        } else if (name == "imu_timeout_s") {
+            imu_timeout_s_ = static_cast<float>(param.as_double());
+            imu_stale_fired_ = false;  // 改了阈值就允许它重新报一次
+            RCLCPP_WARN(this->get_logger(), "imu_timeout_s -> %.3f s", imu_timeout_s_);
+        } else if (name == "cmd_timeout_s") {
+            cmd_timeout_s_ = static_cast<float>(param.as_double());
+            cmd_watchdog_fired_.store(false, std::memory_order_relaxed);
+            RCLCPP_WARN(this->get_logger(), "cmd_timeout_s -> %.3f s", cmd_timeout_s_);
+        } else if (name == "motor_temp_warn_c") {
+            temp_warn_c_ = static_cast<float>(param.as_double());
+            temp_warn_cycles_ = 0;
+            RCLCPP_WARN(this->get_logger(), "motor_temp_warn_c -> %.0f C", temp_warn_c_);
+        } else if (name == "motor_temp_cutoff_c") {
+            temp_cutoff_c_ = static_cast<float>(param.as_double());
+            temp_cutoff_cycles_ = 0;
+            RCLCPP_WARN(this->get_logger(), "motor_temp_cutoff_c -> %.0f C", temp_cutoff_c_);
+        } else {
+            // ⚠️ 其余参数（action_scale / joint_limits / clip_cmd / obs_layouts / model 路径 …）
+            //    只在 load_config 里读一次（declare 那一刻），运行时改【不会生效】。
+            //    那就【明确拒绝】，别让它返回成功然后什么都没发生 ——
+            //    "静默不生效"是本仓库最贵的一类 bug（NaN 守卫、奖励门、gate 都栽在这上面）。
+            result.successful = false;
+            result.reason = name + " is only read at startup; restart the node to change it";
+            return result;
         }
     }
     return result;
@@ -555,7 +647,7 @@ void InferenceNode::check_motor_temperature() {
                          "电机温度 %.0f ℃ > %.0f ℃ ⇒ 停止策略、切 PD 站立。过热: %s",
                          hottest, temp_warn_c_, robot_->hot_motor_list(temp_warn_c_).c_str());
         }
-        switch_to_pd_stand("motor over-temperature");
+        switch_to_pd_stand("motor over-temperature", robot_->hot_motor_list(temp_warn_c_));
     }
     if (temp_cutoff_cycles_ >= kTempConsecutiveCycles && !temp_cutoff_fired_) {
         temp_cutoff_fired_ = true;
@@ -614,12 +706,16 @@ void InferenceNode::control() {
                     //    加了反而挡住）。2026-09-21 a3e1519 引入，一直是空操作。
                     //    正解是【取反、用 ||】：非有限值 ⇒ 也要切。
                     if (!std::isfinite(g_b.z()) || g_b.z() > gravity_z_upper_) {
-                        switch_to_pd_stand(std::isfinite(g_b.z())
-                                               ? "fall detected (gravity_b.z > threshold)"
-                                               : "IMU invalid (gravity_b.z not finite)");
+                        const bool finite = std::isfinite(g_b.z());
+                        switch_to_pd_stand(
+                            finite ? "fall detected (gravity_b.z > threshold)"
+                                   : "IMU invalid (gravity_b.z not finite)",
+                            finite ? "gravity_b.z = " + std::to_string(g_b.z()) +
+                                         ", threshold " + std::to_string(gravity_z_upper_)
+                                   : std::string("quaternion not usable"));
                     }
                 } catch (const std::exception& e) {
-                    switch_to_pd_stand("IMU read failed in safety check");
+                    switch_to_pd_stand("IMU read failed in safety check", e.what());
                 }
 
                 // ⭐ IMU 数据陈旧降级（2026-09-22）
@@ -638,7 +734,9 @@ void InferenceNode::control() {
                                      "注意姿态是【冻住】的不是 NaN，上面的 NaN 守卫不会响",
                                      imu_age_s * 1000.0f, imu_timeout_s_ * 1000.0f);
                     }
-                    switch_to_pd_stand("IMU data stale");
+                    switch_to_pd_stand("IMU data stale",
+                                       std::to_string(static_cast<int>(imu_age_s * 1000.0f)) +
+                                           " ms without a new frame");
                 }
 
                 // ⭐ 指令看门狗（2026-09-22）：手柄 / `/cmd_vel` 断线 ⇒ 切 PD 站立。
@@ -655,7 +753,8 @@ void InferenceNode::control() {
                                          "cmd watchdog: 指令已停 %.2f s (> %.2f s) ⇒ 切 PD 站立",
                                          age_s, cmd_timeout_s_);
                         }
-                        switch_to_pd_stand("cmd timeout (joystick / cmd_vel silent)");
+                        switch_to_pd_stand("cmd timeout (joystick / cmd_vel silent)",
+                                           std::to_string(age_s) + " s since the last command");
                     } else {
                         cmd_watchdog_fired_.store(false, std::memory_order_relaxed);
                     }
@@ -704,6 +803,34 @@ void InferenceNode::inference() {
     while(rclcpp::ok()){
         next_release += period;
         auto loop_start = std::chrono::steady_clock::now();
+        // ⭐ PD 站立保底（2026-09-17）：PD 模式下【不跑网络】。
+        //    ⚠️ 2026-09-22 改：act_ 不再由这里写 —— 改由 control 线程在
+        //       apply_action() 里写（它 250 Hz 一直在跑，不依赖推理线程活着）。
+        //       两处都写会在 pd_stand_target_ ≠ joint_default_angle_ 时互相覆盖：
+        //       两个线程频率不同 ⇒ 目标在两个值之间来回跳。
+        //       这里只负责把 last_act_ 发到 /action 话题上（观测用）。
+        //    ⚠️ 2026-09-22 又改：这段必须放在 is_running_ 那道门【之前】——
+        //       规则要和 control 线程里 apply_action() 一致：PD 保底【绕过 is_running_】。
+        //       （apply_action 顶部就是这么写的：PD 模式独立下发，不受"策略跑不跑"管。）
+        //       原来放在门后，后果是 PD 站立那一段虽然在真发命令，/action 却一条没有
+        //       ⇒ bag 里那一段是空的。A2 的验收（/action 与电机实际目标一致）
+        //       对这种状态尤其不能漏。
+        //       ⚠️ 这个循环里有【两道】is_running_ 检查（门外一道、门内一道，
+        //          门内那道是给 mode_mutex_ 竞争用的），别只挪过其中一道。
+        if (act_mode_.load() == ActMode::PD_STAND) {
+            publish_action();
+            const auto now = std::chrono::steady_clock::now();
+            if (now > next_release) {
+                const auto missed_periods = (now - next_release) / period;
+                next_release += period * missed_periods;
+                if (next_release < now) {
+                    next_release += period;
+                }
+            }
+            std::this_thread::sleep_until(next_release);
+            continue;
+        }
+
         if(!is_running_.load()){
             const auto now = std::chrono::steady_clock::now();
             if (now > next_release) {
@@ -720,26 +847,6 @@ void InferenceNode::inference() {
         try {
             std::unique_lock<std::mutex> mode_lock(mode_mutex_);
             if (!is_running_.load()) {
-                mode_lock.unlock();
-                const auto now = std::chrono::steady_clock::now();
-                if (now > next_release) {
-                    const auto missed_periods = (now - next_release) / period;
-                    next_release += period * missed_periods;
-                    if (next_release < now) {
-                        next_release += period;
-                    }
-                }
-                std::this_thread::sleep_until(next_release);
-                continue;
-            }
-            // ⭐ PD 站立保底（2026-09-17）：PD 模式下【不跑网络】。
-            //    ⚠️ 2026-09-22 改：act_ 不再由这里写 —— 改由 control 线程在
-            //       apply_action() 里写（它 250 Hz 一直在跑，不依赖推理线程活着）。
-            //       两处都写会在 pd_stand_target_ ≠ joint_default_angle_ 时互相覆盖：
-            //       两个线程频率不同 ⇒ 目标在两个值之间来回跳。
-            //       这里只负责把 act_ 发到 /action 话题上（观测用）。
-            if (act_mode_.load() == ActMode::PD_STAND) {
-                publish_action();
                 mode_lock.unlock();
                 const auto now = std::chrono::steady_clock::now();
                 if (now > next_release) {
@@ -838,7 +945,9 @@ void InferenceNode::inference() {
                              "推理连续 %d 次 overrun（本次 %lld us / 周期 %lld us）⇒ 切 PD 站立",
                              overrun_streak, static_cast<long long>(elapsed_time.count()),
                              static_cast<long long>(period.count()));
-                switch_to_pd_stand("inference overrun");
+                switch_to_pd_stand("inference overrun",
+                                   "took " + std::to_string(elapsed_time.count()) +
+                                       " us, period " + std::to_string(period.count()) + " us");
             }
             RCLCPP_WARN(this->get_logger(), "Inference loop overran! Took %lld us, but period is %lld us.", static_cast<long long>(elapsed_time.count()), static_cast<long long>(period.count()));
             const auto missed_periods = (loop_end - next_release) / period;

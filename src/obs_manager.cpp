@@ -207,9 +207,12 @@ void InferenceNode::get_gravity_b_obs(std::vector<float>& segment) {
     // 🔴 2026-09-22 修：同 inference_node.cpp 那处 —— 原来是 `isfinite && >`，
     //    对 NaN 是空操作。改成 `!isfinite || >`：非有限值（IMU 掉线）也切。
     if (!std::isfinite(gravity_b.z()) || gravity_b.z() > gravity_z_upper_) {
-        switch_to_pd_stand(std::isfinite(gravity_b.z())
-                               ? "fall detected in obs (gravity_b.z > threshold)"
-                               : "IMU invalid in obs (gravity_b.z not finite)");
+        const bool finite = std::isfinite(gravity_b.z());
+        switch_to_pd_stand(
+            finite ? "fall detected in obs (gravity_b.z > threshold)"
+                   : "IMU invalid in obs (gravity_b.z not finite)",
+            finite ? "gravity_b.z = " + std::to_string(gravity_b.z())
+                   : std::string("quaternion not usable"));
         // 继续填 segment（本周期观测仍会算完，虽然 PD 模式下已不喂网络）
     }
     segment[0] = gravity_b.x() * obs_scales_gravity_b_;
@@ -233,7 +236,11 @@ void InferenceNode::get_dof_pos_obs(std::vector<float>& segment) {
         if(joint_pos_buffer_[i] < joint_limits_[i * 2] || joint_pos_buffer_[i] > joint_limits_[i * 2 + 1]){
             // ⭐ PD 站立保底（2026-09-17）：超限【不再关机】，改为切 PD 站立。
             //    ⚠️ 不 throw（见上）。切 PD 后不再喂网络，所以 segment 填不填无所谓。
-            switch_to_pd_stand("joint out of limit");
+            switch_to_pd_stand("joint out of limit",
+                               "joint " + std::to_string(i) + " = " +
+                                   std::to_string(joint_pos_buffer_[i]) + ", limit [" +
+                                   std::to_string(joint_limits_[i * 2]) + ", " +
+                                   std::to_string(joint_limits_[i * 2 + 1]) + "]");
             break;
         }
     }
