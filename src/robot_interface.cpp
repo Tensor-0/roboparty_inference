@@ -381,11 +381,11 @@ void RobotInterface::clear_errors() {
 //           本来就 ≤ 7 ⇒ 它永远是初值 0，判不了"使能"这件事。
 //           （memory: dm-driver-error-id-bug，这个坑踩过）
 //
-//     ② 存活。refresh 之后 50 ms 内有没有回复 —— 用 response_count_ == 0 判。
+//     ② 存活。refresh 之后有没有回复 —— 用 response_count_ == 0 判，重试 3 轮。
 //        和运行时离线判定是同一个原语：每收到一帧就清零，且【先按电机 ID 过滤】
 //        （dm_motor_driver.cpp:224-229），别的电机的回复不算数。
-//        ⚠️ 这里用 > 0 而不是 > offline_threshold_（25）：init 只发了 1 帧，
-//           拿 25 当阈值等于没检查。
+//        ⚠️ 这里不能用 offline_threshold_（25）当阈值：init 才发了几帧，
+//           拿 25 当阈值等于没检查；也不能只探一轮 —— 见下面 kProbeRounds 的实测记录。
 //        ⚠️ CANFD 的一条 MIT 帧由总线上的 0 号电机代发，所以运行时那个
 //           offline_threshold_ 判定对同总线其它电机是失效的；但 refresh 是
 //           【每台电机各发一帧】的，所以这里的探针对 CAN 和 CANFD 都成立。
@@ -429,17 +429,38 @@ void RobotInterface::init_motors() {
     });
 
     if (failures.empty()) {
-        exec_motors_parallel([](std::shared_ptr<MotorDriver>& motor, int) {
-            motor->refresh_motor_status();
-        });
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        exec_motors_parallel([&](std::shared_ptr<MotorDriver>& motor, int idx) {
-            if (motor->get_response_count() > 0) {
-                std::lock_guard<std::mutex> lock(failures_mutex);
-                failures.push_back(describe_motor(static_cast<size_t>(idx)) +
-                                   ": no reply within 50 ms after refresh");
+        // ⭐ 存活探针（2026-09-22）：refresh 之后有没有回复。
+        //   ⚠️ 实测（2026-09-22，真机第一次使能）：单轮 50 ms 会【假阳性】——
+        //      10 台里 8 台秒回，右腿 id=3/id=4 在刚跑完 init 序列那一刻晚回，
+        //      于是整个 init 被拒。而逐台单独刷、间隔 60 ms 时 10/10 都正常。
+        //      ⇒ 假阳性的代价是"机器人根本没法上电"，所以这里必须重试。
+        //      判据不变（真死的电机每一轮都不会回），只是不拿单次慢回当事。
+        constexpr int kProbeRounds = 3;
+        constexpr int kProbeRoundMs = 60;
+        std::vector<bool> answered(motors_.size(), false);
+        for (int round = 0; round < kProbeRounds; ++round) {
+            exec_motors_parallel([&](std::shared_ptr<MotorDriver>& motor, int idx) {
+                if (!answered[static_cast<size_t>(idx)]) {
+                    motor->refresh_motor_status();
+                }
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(kProbeRoundMs));
+            exec_motors_parallel([&](std::shared_ptr<MotorDriver>& motor, int idx) {
+                if (motor->get_response_count() == 0) {
+                    answered[static_cast<size_t>(idx)] = true;
+                }
+            });
+            if (std::all_of(answered.begin(), answered.end(), [](bool ok) { return ok; })) {
+                break;
             }
-        });
+        }
+        for (size_t idx = 0; idx < motors_.size(); ++idx) {
+            if (!answered[idx]) {
+                std::lock_guard<std::mutex> lock(failures_mutex);
+                failures.push_back(describe_motor(idx) + ": no reply after " +
+                                   std::to_string(kProbeRounds) + " refreshes");
+            }
+        }
     }
 
     if (!failures.empty()) {
