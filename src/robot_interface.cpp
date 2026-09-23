@@ -67,8 +67,15 @@ RobotInterface::RobotInterface(const std::string& config_file) {
                                     robot_cfg_->extrinsic_R_[3], robot_cfg_->extrinsic_R_[4], robot_cfg_->extrinsic_R_[5],
                                     robot_cfg_->extrinsic_R_[6], robot_cfg_->extrinsic_R_[7], robot_cfg_->extrinsic_R_[8];
                 Eigen::Quaternionf q_R(extrinsic_R_mat_);  // quaternion of R (Body->IMU)
+                // ⚠️ 这里取了逆是对的（"we need R_inv"），但下游 read_imu() 里
+                //    把它【乘在了错误的顺序上】—— 见那里 2026-09-24 的说明块。
                 extrinsic_q_inv_ = q_R.inverse();           // we need R_inv for quaternion transform
             }
+            // ⚠️ 2026-09-24：size 不是 9 时上面整段被【静默跳过】，
+            //    extrinsic_R_mat_ 保持 Identity ——
+            //    也就是说配错长度 = 悄悄退回"假设 IMU 装正了"，不报错、不警告。
+            //    （本文件不含 rclcpp 头，加不了 WARN；要加得先引头文件，
+            //      属于行为改动，留到修这三行时一起做。）
         }
         for (size_t ankle_idx = 0; ankle_idx < robot_cfg_->close_chain_motor_idx_.size(); ++ankle_idx) {
             const long int idx = robot_cfg_->close_chain_motor_idx_[ankle_idx];
@@ -177,6 +184,34 @@ void RobotInterface::read_imu() {
     const auto raw_quat = imu_->get_quat();          // w, x, y, z
     const auto raw_ang_vel = imu_->get_ang_vel();  // in IMU frame
     const auto raw_lin_acc = imu_->get_lin_acc();  // in IMU frame, m/s^2, gravity included
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ⚠️⚠️ 下面三行【只在 extrinsic_R = I 时正确】。2026-09-24 复核确认有误，
+    //      但【现在不改】—— 理由见本节末尾。重新标定 IMU 外参之前必须修。
+    //
+    // 事实（上游 Luo1imasi 2026-08-19 提交 ac448b1 写下时即有误）：
+    //   · 四元数：取了逆（:70），但【乘法顺序反了】
+    //   · 角速度/加速度：该用 R⁻¹，却直接用了 R
+    //
+    // 正确写法（extrinsic_R 的注释是 "Body→IMU"，即 v_imu = R · v_body）：
+    //   ⇒ 转回机体系要乘 R⁻¹：
+    //        q_body     = extrinsic_q_inv_ * raw_quat          ← 顺序与现在相反
+    //        omega_body = extrinsic_R_mat_.transpose() * omega_imu
+    //        lin_acc    = extrinsic_R_mat_.transpose() * acc_imu
+    //    （旋转矩阵正交 ⇒ R⁻¹ = Rᵀ，用 transpose 更快更准）
+    //
+    // 为什么是「顺序反」而不是「少乘一个逆」：
+    //   展开验证过 —— `raw_quat * extrinsic_q_inv_` 等价于
+    //   R_raw · R_ext⁻¹，而正确结果是 R_ext⁻¹ · R_raw。矩阵乘法不交换。
+    //
+    // 【为什么现在不改】
+    //   ① DM10 实测外参就是单位阵（2026-09-17：X前/Z上/转身轴，倾角 0°，
+    //      见 robots/dm10/robot.yaml 的 extrinsic_R 注释）
+    //   ② R = I ⇒ R⁻¹ = I，且 I·X = X·I ⇒ 三种写法结果完全一样
+    //      ⇒ 【改了也不产生任何行为变化，无法验证改对了没有】
+    //   ③ 所以现在改是"无验证的改动" —— 风险 > 收益
+    //   真正的时机：将来真要标定 IMU 外参时，那时有真值可验证，一起改。
+    // ══════════════════════════════════════════════════════════════════════════
     Eigen::Quaternionf q_body =
         Eigen::Quaternionf(raw_quat[0], raw_quat[1], raw_quat[2], raw_quat[3]) * extrinsic_q_inv_;
     q_body.normalize();
@@ -189,7 +224,7 @@ void RobotInterface::read_imu() {
     quat_buf_[3] = q_body.z();
     Eigen::Map<Eigen::Vector3f>(ang_vel_buf_.data()) = omega_body;
     Eigen::Map<const Eigen::Vector3f> acc_imu(raw_lin_acc.data());
-    Eigen::Map<Eigen::Vector3f>(lin_acc_buf_.data()) = extrinsic_R_mat_ * acc_imu;
+    Eigen::Map<Eigen::Vector3f>(lin_acc_buf_.data()) = extrinsic_R_mat_ * acc_imu;  // ⚠️ 同上，应为 transpose()
 }
 
 void RobotInterface::apply_action(const std::vector<float>& p,
