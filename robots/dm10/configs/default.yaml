@@ -74,9 +74,16 @@ inference_node:
         # ⚠️ MUST have exactly 10 elements. joint_default_angle_ is indexed with NO
         # length validation (unlike action_scale, ros_interface.cpp:93-100), so a
         # short list is an out-of-bounds read that starts up without complaining.
+        # ⚠️ 2026-09-24：改回【屈膝】，与下列三者对齐：
+        #   ① 板子上实际跑的值（板子一直是屈膝，靠 ROS 日志核实过）
+        #   ② 达妙官方 MPC 的 defaultJointState（reference.info）
+        #   ③ 训练侧 keyframe（同一天改回屈膝，见 scene_flat*.xml）
+        # 参考系一变，所有现有 checkpoint 作废 —— 下一版重训用这个系。
+        # ⚠️ 它必须等于【所部署那份策略训练时】的参考系：
+        #   单边改 ⇒ 策略整体平移一个常数 ⇒ 发散，且没有任何自动校验。
         joint_default_angle:
-            [0.0, 0.0, 0.0, 0.0, 0.0,
-             0.0, 0.0, 0.0, 0.0, 0.0]
+            [-0.4, 0.0, 0.0, 0.8, -0.4,
+             -0.4, 0.0, 0.0, 0.8, -0.4]
         # Joint limits from the dm10 MJCF (l1..l5, r1..r5).
         joint_limits:
             [-1.05, 1.05, -0.52, 0.785, -0.52, 0.785, -0.3, 2.3562, -1.047, 0.3,
